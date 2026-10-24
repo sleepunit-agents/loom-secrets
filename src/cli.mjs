@@ -14,6 +14,8 @@
 //   - the gate is a guardrail, not a boundary: a same-user process that can
 //     read the age key can run sops itself. The boundary is where the key
 //     lives (README, "Threat model").
+//   - loom's page (`ui`) is write-only: add, replace, remove. A value comes in
+//     on `ui act`'s stdin JSON and never goes out in any ui answer
 //   - it never touches loom's stores
 import { spawnSync } from 'node:child_process';
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -34,7 +36,11 @@ const USAGE = `Usage: loom secrets <command> [args]
   get <name> --reveal           Print a value: only at a terminal, or with
                                 LOOM_SECRETS_ALLOW_GET=1 set by the host side
   podman <name> <podman-name>   Put the value into a podman secret, unprinted
-  ui --json                     The section for loom's page (a count, no names)
+  ui --json                     loom's page: the manifest (tab, Home tile)
+  ui page --json                loom's page: one page, from {path, query} on stdin
+  ui act --json                 loom's page: add / replace / remove, from
+                                {action, path, fields} on stdin. Write-only:
+                                there is no action that reads a value back
 
 Values are never taken from argv. Store: $LOOM_SECRETS_DIR (default
 ~/.config/loom-secrets), sops + age. Binaries: $LOOM_SECRETS_SOPS (default
@@ -114,6 +120,32 @@ function withLock(c, fn) {
   finally { closeSync(fd); rmSync(lock, { force: true }); }
 }
 
+/**
+ * The one write path, shared by `add` and the page. `mode` is 'new' (refuse
+ * an existing name), 'existing' (the name must be there) or 'any' (--force).
+ * The value reaches sops on stdin only (encrypt), never argv, env or disk.
+ */
+function put(c, env, name, value, mode) {
+  checkName(name);
+  withLock(c, () => {
+    const data = decrypt(c, env);
+    if (mode === 'new' && Object.hasOwn(data, name)) throw new Fail(`${name} already exists (pass --force to replace it)`, 3);
+    if (mode === 'existing' && !Object.hasOwn(data, name)) throw new Fail(`no secret named ${name}`, 3);
+    data[name] = value;
+    encrypt(c, env, data);
+  });
+}
+
+function remove(c, env, name) {
+  checkName(name);
+  withLock(c, () => {
+    const data = decrypt(c, env);
+    if (!Object.hasOwn(data, name)) throw new Fail(`no secret named ${name}`, 3);
+    delete data[name];
+    encrypt(c, env, data);
+  });
+}
+
 async function readValue(io) {
   if (!io.stdinIsTTY) {
     const chunks = [];
@@ -138,6 +170,159 @@ async function readValue(io) {
     stdin.on('data', onData);
     stdin.resume();
   });
+}
+
+// ---- loom's page (contract v2) -------------------------------------------
+// Everything below answers with data for loom to render; never markup, never
+// a value. The only way in for a value is `ui act`'s stdin JSON.
+
+const NAME_HINT = 'Letters, digits, dot, dash and underscore. It starts with a letter or digit, 64 at most. ' +
+  'The name is the only part anyone sees again.';
+const MAX_VALUE = 64 * 1024;          // bytes, as loom's own cap on a post
+const MAX_REQUEST = 1024 * 1024;      // stdin JSON for page/act
+const PER_SECTION = 20;               // loom: 20 blocks a section
+const NAME_SECTIONS = 8;              // loom: 10 sections a page; 1 for the form, 1 for the part picker
+const PER_PART = PER_SECTION * NAME_SECTIONS;
+const NOT_FOUND = { title: 'Not found', sections: [] };
+
+/** stdin JSON for `ui page` / `ui act`. Anything unreadable comes back as null. */
+async function readRequest(io) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of io.stdin) {
+    size += chunk.length;
+    if (size > MAX_REQUEST) return null;
+    chunks.push(Buffer.from(chunk));
+  }
+  try {
+    const req = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+    return req && typeof req === 'object' && !Array.isArray(req) ? req : null;
+  } catch { return null; }
+}
+
+function uiManifest(c) {
+  const keyed = existsSync(c.key);
+  return {
+    v: 2,
+    tab: { label: 'Secrets' },
+    tile: {
+      label: 'Secrets',
+      value: String(names(c).length),
+      detail: keyed ? 'Key on this host' : 'No key',
+      tone: keyed ? 'ok' : 'bad',
+      page: '',
+    },
+    asks: [],
+  };
+}
+
+function uiPage(c, req) {
+  if (!req || req.path !== '') return NOT_FOUND;
+  const query = req.query && typeof req.query === 'object' ? req.query : {};
+  const all = names(c);
+  const keyed = existsSync(c.key);
+  const parts = Math.max(1, Math.ceil(all.length / PER_PART));
+  let part = /^[1-9][0-9]{0,5}$/.test(String(query.part ?? '')) ? Number(query.part) : 1;
+  if (part > parts) part = 1;
+  const shown = all.slice((part - 1) * PER_PART, part * PER_PART);
+
+  const top = [
+    { type: 'stats', items: [
+      { label: 'Stored', value: String(all.length) },
+      { label: 'Key', value: keyed ? 'On this host' : 'Missing', tone: keyed ? 'ok' : 'bad' },
+    ] },
+  ];
+  if (!keyed) top.push({ type: 'callout', tone: 'bad', title: 'No age key',
+    text: `There is no age key at ${c.key}, so nothing can be stored. Run: loom secrets init` });
+  top.push({
+    type: 'form', title: 'Add a secret', action: 'add', submit: 'Encrypt and save',
+    note: 'The value goes from this form to the secrets piece on stdin and into the encrypted store. ' +
+      'loom never logs or keeps it, and it is never shown here again.',
+    fields: [
+      { name: 'name', label: 'Name', kind: 'text', hint: NAME_HINT, required: true },
+      { name: 'value', label: 'Value', kind: 'secret', required: true,
+        hint: 'One line, 64 KB at most. For a multi-line value (a JSON key, an .env), pipe it in: loom secrets add <name>' },
+    ],
+  });
+  const sections = [{ id: 'add', blocks: top }];
+
+  if (shown.length === 0) {
+    sections.push({ id: 'store', title: 'In the store', blocks: [{ type: 'text', tone: 'muted', text: 'Nothing stored yet.' }] });
+  }
+  for (let i = 0; i < shown.length; i += PER_SECTION) {
+    const first = i === 0;
+    sections.push({
+      id: first ? 'store' : `store-${i / PER_SECTION + 1}`,
+      ...(first ? { title: 'In the store' } : {}),
+      blocks: shown.slice(i, i + PER_SECTION).map(nameRow),
+    });
+  }
+  if (parts > 1) {
+    const options = [];
+    for (let p = 1; p <= parts; p++) {
+      const from = (p - 1) * PER_PART;
+      options.push({ value: p === 1 ? '' : String(p),
+        label: `${all[from]} to ${all[Math.min(from + PER_PART, all.length) - 1]}` });
+    }
+    sections.push({ id: 'parts', side: true, title: `Showing ${shown.length} of ${all.length}`,
+      blocks: [{ type: 'filters', param: 'part', options }] });
+  }
+  return {
+    title: 'Secrets',
+    intro: 'Encrypted at rest with sops and age. Bodies get them injected when they start. ' +
+      'You can add, replace and remove them here, but there is no way to read one back.',
+    sections,
+  };
+}
+
+/** One stored name: folded, with a Replace form and a Remove button inside. Never a value. */
+function nameRow(name) {
+  return {
+    type: 'details', summary: name,
+    blocks: [
+      { type: 'form', title: `Replace ${name}`, action: 'replace', submit: 'Replace', hidden: { name },
+        note: 'The old value is overwritten. It is not shown, here or anywhere on this page.',
+        fields: [{ name: 'value', label: 'New value', kind: 'secret', required: true }] },
+      { type: 'buttons', items: [{ action: 'remove', label: 'Remove', tone: 'danger', fields: { name } }] },
+    ],
+  };
+}
+
+const MESSAGES = {
+  add: (n) => `${n} is encrypted and stored. Bodies pick it up the next time they start.`,
+  replace: (n) => `${n} is replaced. Bodies pick up the new value the next time they start.`,
+  remove: (n) => `${n} is removed from the store.`,
+};
+
+function uiAct(c, env, req) {
+  const no = (message) => ({ ok: false, message, page: '' });
+  if (!req) return no('That request could not be read.');
+  const action = req.action;
+  if (!Object.hasOwn(MESSAGES, action)) return no('The secrets piece has no such action.');
+  const fields = req.fields && typeof req.fields === 'object' ? req.fields : {};
+  const name = fields.name;
+  // Never echo a name that fails the rules: whatever was typed there may be a value.
+  if (typeof name !== 'string' || !NAME.test(name)) return no(`That is not a secret name. ${NAME_HINT}`);
+  let value;
+  if (action !== 'remove') {
+    value = fields.value;
+    if (typeof value !== 'string' || value === '') return no(`Nothing stored: the value for ${name} is empty.`);
+    if (Buffer.byteLength(value, 'utf-8') > MAX_VALUE) return no(`Nothing stored: the value for ${name} is over 64 KB.`);
+  }
+  try {
+    if (action === 'add') put(c, env, name, value, 'new');
+    else if (action === 'replace') put(c, env, name, value, 'existing');
+    else remove(c, env, name);
+  } catch (err) {
+    let message = err instanceof Fail && err.code === 3
+      ? (action === 'add' ? `${name} already exists. To change it, use Replace on ${name} under In the store.`
+        : `There is no secret named ${name}.`)
+      : `Nothing changed for ${name}: ${err.message}`;
+    // A tool's error text should never carry the value, but make sure.
+    if (value && message.includes(value)) message = `Nothing changed for ${name}: the store could not be written.`;
+    return no(message);
+  }
+  return { ok: true, message: MESSAGES[action](name), page: '' };
 }
 
 function revealAllowed(io) {
@@ -176,30 +361,22 @@ export async function main(argv, io) {
       }
       const value = await readValue(io);
       if (!value) throw new Fail('empty value; nothing stored', 2);
-      withLock(c, () => {
-        const data = decrypt(c, io.env);
-        if (pos[0] in data && !flags.has('--force')) throw new Fail(`${pos[0]} already exists (pass --force to replace it)`, 3);
-        data[pos[0]] = value;
-        encrypt(c, io.env, data);
-      });
+      put(c, io.env, pos[0], value, flags.has('--force') ? 'any' : 'new');
       io.stderr(`stored ${pos[0]}\n`);
       return 0;
     }
 
     case 'ui': {
-      // The secrets piece's section on loom's page (loom docs/extensions.md,
-      // "UI sections"). A count and where the store lives: never a name or a value.
+      // The secrets piece on loom's page (loom docs/extensions.md, "The page",
+      // contract v2). Write-only: the page can add, replace and remove, and
+      // nothing in it can read a value back. See README, ac-sec-ui-*.
       allow(['--json']);
-      const n = names(c);
-      const keyed = existsSync(c.key);
-      io.stdout(JSON.stringify({ sections: [{ id: 'store', title: 'Secrets', blocks: [
-        { type: 'stats', items: [
-          { label: 'secrets', value: String(n.length) },
-          { label: 'key', value: keyed ? 'on this host' : 'missing', tone: keyed ? 'ok' : 'bad' },
-        ] },
-        { type: 'text', text: 'sops + age, encrypted at rest. Bodies get secrets injected, never read from here.' },
-      ] }] }) + '\n');
-      return 0;
+      const sub = pos[0];
+      if (sub === undefined) { io.stdout(JSON.stringify(uiManifest(c)) + '\n'); return 0; }
+      if (pos.length > 1) throw new Fail(`usage: loom secrets ui [page|act] --json`, 2);
+      if (sub === 'page') { io.stdout(JSON.stringify(uiPage(c, await readRequest(io))) + '\n'); return 0; }
+      if (sub === 'act') { io.stdout(JSON.stringify(uiAct(c, io.env, await readRequest(io))) + '\n'); return 0; }
+      throw new Fail(`unknown ui command ${sub}\n${USAGE}`, 2);
     }
 
     case 'list': {
@@ -212,12 +389,7 @@ export async function main(argv, io) {
     case 'rm': {
       allow([]);
       checkName(pos[0]);
-      withLock(c, () => {
-        const data = decrypt(c, io.env);
-        if (!(pos[0] in data)) throw new Fail(`no secret named ${pos[0]}`, 3);
-        delete data[pos[0]];
-        encrypt(c, io.env, data);
-      });
+      remove(c, io.env, pos[0]);
       io.stderr(`removed ${pos[0]}\n`);
       return 0;
     }
@@ -231,7 +403,7 @@ export async function main(argv, io) {
           'A body gets secrets injected into its runtime, not read out of the store.', 4);
       }
       const data = decrypt(c, io.env);
-      if (!(pos[0] in data)) throw new Fail(`no secret named ${pos[0]}`, 3);
+      if (!Object.hasOwn(data, pos[0])) throw new Fail(`no secret named ${pos[0]}`, 3);
       io.stdout(data[pos[0]] + (io.stdoutIsTTY ? '\n' : ''));
       return 0;
     }
@@ -246,7 +418,7 @@ export async function main(argv, io) {
         throw new Fail('refused: podman injection is host-side only (an interactive terminal, or LOOM_SECRETS_ALLOW_GET=1 from the host side).', 4);
       }
       const data = decrypt(c, io.env);
-      if (!(pos[0] in data)) throw new Fail(`no secret named ${pos[0]}`, 3);
+      if (!Object.hasOwn(data, pos[0])) throw new Fail(`no secret named ${pos[0]}`, 3);
       // podman, like sops, wants a real pipe on stdin, not node's socketpair.
       run('sh', ['-c', 'cat | "$0" "$@"', c.podman, 'secret', 'create', '--replace', pos[1], '-'],
         { input: data[pos[0]], env: io.env });
