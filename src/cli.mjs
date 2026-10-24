@@ -34,6 +34,7 @@ const USAGE = `Usage: loom secrets <command> [args]
   get <name> --reveal           Print a value: only at a terminal, or with
                                 LOOM_SECRETS_ALLOW_GET=1 set by the host side
   podman <name> <podman-name>   Put the value into a podman secret, unprinted
+  ui --json                     The section for loom's page (a count, no names)
 
 Values are never taken from argv. Store: $LOOM_SECRETS_DIR (default
 ~/.config/loom-secrets), sops + age. Binaries: $LOOM_SECRETS_SOPS (default
@@ -182,6 +183,22 @@ export async function main(argv, io) {
         encrypt(c, io.env, data);
       });
       io.stderr(`stored ${pos[0]}\n`);
+      return 0;
+    }
+
+    case 'ui': {
+      // The secrets piece's section on loom's page (loom docs/extensions.md,
+      // "UI sections"). A count and where the store lives: never a name or a value.
+      allow(['--json']);
+      const n = names(c);
+      const keyed = existsSync(c.key);
+      io.stdout(JSON.stringify({ sections: [{ id: 'store', title: 'Secrets', blocks: [
+        { type: 'stats', items: [
+          { label: 'secrets', value: String(n.length) },
+          { label: 'key', value: keyed ? 'on this host' : 'missing', tone: keyed ? 'ok' : 'bad' },
+        ] },
+        { type: 'text', text: 'sops + age, encrypted at rest. Bodies get secrets injected, never read from here.' },
+      ] }] }) + '\n');
       return 0;
     }
 

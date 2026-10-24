@@ -125,3 +125,13 @@ test('the value never shows in any argv while the CLI runs', { skip }, () => {
   const src = readFileSync(CLI, 'utf-8');
   assert.match(src, /'--filename-override', STORE, '\/dev\/stdin'\]/);
 });
+
+test('ui gives loom a count and the key state, never a name or a value', { skip }, () => {
+  cli(['add', 'ui-check'], { input: 'super-secret-value' });
+  const r = cli(['ui', '--json']);
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.sections[0].id, 'store');
+  assert.ok(!r.stdout.includes('ui-check') && !r.stdout.includes('super-secret-value'));
+  assert.deepEqual(out.sections[0].blocks[0].items.map((i) => i.label), ['secrets', 'key']);
+});
