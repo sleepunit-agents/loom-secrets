@@ -17,6 +17,10 @@
 //   - loom's page (`ui`) is write-only: add, replace, remove. A value comes in
 //     on `ui act`'s stdin JSON and never goes out in any ui answer
 //   - it never touches loom's stores
+//   - `bundle export` / `bundle import` are loom's bundle seam: export hands over the
+//     decrypted map re-encrypted (age) to the owner's recipients, import opens
+//     it with the owner's identity and re-encrypts it to this machine's key.
+//     Plaintext only ever travels on stdin/stdout pipes, never argv or disk
 import { spawnSync } from 'node:child_process';
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -41,11 +45,17 @@ const USAGE = `Usage: loom secrets <command> [args]
   ui act --json                 loom's page: add / replace / remove, from
                                 {action, path, fields} on stdin. Write-only:
                                 there is no action that reads a value back
+  bundle export                 loom's bundle: the store, age-encrypted to
+                                $LOOM_EXPORT_RECIPIENTS (comma-separated), on stdout
+  bundle import [--force]       loom's restore: a part from export on stdin,
+                                opened with $LOOM_IMPORT_IDENTITY and re-encrypted
+                                to this machine's key (refuses a non-empty store
+                                without --force)
 
 Values are never taken from argv. Store: $LOOM_SECRETS_DIR (default
 ~/.config/loom-secrets), sops + age. Binaries: $LOOM_SECRETS_SOPS (default
-sops), $LOOM_SECRETS_AGE_KEYGEN (default age-keygen), $LOOM_SECRETS_PODMAN
-(default podman).
+sops), $LOOM_SECRETS_AGE (default age), $LOOM_SECRETS_AGE_KEYGEN (default
+age-keygen), $LOOM_SECRETS_PODMAN (default podman).
 `;
 
 class Fail extends Error {
@@ -59,6 +69,7 @@ function config(env) {
     store: join(dir, STORE),
     key: env.SOPS_AGE_KEY_FILE || join(dir, KEY),
     sops: env.LOOM_SECRETS_SOPS || 'sops',
+    age: env.LOOM_SECRETS_AGE || 'age',
     keygen: env.LOOM_SECRETS_AGE_KEYGEN || 'age-keygen',
     podman: env.LOOM_SECRETS_PODMAN || 'podman',
   };
@@ -325,6 +336,96 @@ function uiAct(c, env, req) {
   return { ok: true, message: MESSAGES[action](name), page: '' };
 }
 
+// ---- loom's bundle (household.md, "Export and restore") -------------------
+// The part is `age -e -a -r R…` over the canonical JSON of the decrypted map:
+//   {"format":"loom-secrets/1","secrets":{"<name>":"<value>", …}}  (names sorted)
+// No sops metadata travels, so import needs only age and the owner's identity.
+// Plaintext moves between sops and age through this process's memory and their
+// stdin/stdout pipes: never argv, env, a log or a file.
+
+const PART_FORMAT = 'loom-secrets/1';
+const AGE_RECIPIENT = /^age1[0-9a-z]{20,}$/;              // X25519 or a plugin (age1yubikey1…)
+const SSH_RECIPIENT = /^(ssh-ed25519|ssh-rsa) [A-Za-z0-9+/]+={0,3}( [^,\n]*)?$/;
+
+function exportRecipients(env) {
+  const raw = env.LOOM_EXPORT_RECIPIENTS;
+  const list = (raw || '').split(',').map((r) => r.trim()).filter(Boolean);
+  if (list.length === 0) {
+    throw new Fail('refused: LOOM_EXPORT_RECIPIENTS is empty. Export needs at least one age recipient (age1…) ' +
+      'to encrypt the part to; it never writes the store out in the clear.', 2);
+  }
+  list.forEach((r, i) => {
+    if (AGE_RECIPIENT.test(r) || SSH_RECIPIENT.test(r)) return;
+    // Never echo it: a private key pasted in by mistake would land in a log.
+    const hint = /^AGE-SECRET-KEY-/i.test(r) ? ' It looks like a private key; pass the public one (age-keygen -y).' : '';
+    throw new Fail(`refused: recipient ${i + 1} in LOOM_EXPORT_RECIPIENTS isn't an age recipient (age1…) or an ssh public key.${hint}`, 2);
+  });
+  return list;
+}
+
+function canonicalPart(data) {
+  const secrets = {};
+  for (const name of Object.keys(data).sort()) secrets[name] = data[name];
+  return JSON.stringify({ format: PART_FORMAT, secrets });
+}
+
+function exportPart(c, env) {
+  const recipients = exportRecipients(env);
+  // No store yet: an empty part, so a restore lays down an empty store too.
+  const data = decrypt(c, env);
+  const part = run(c.age, ['-e', '-a', ...recipients.flatMap((r) => ['-r', r])], { input: canonicalPart(data), env });
+  return { part, count: Object.keys(data).length, recipients: recipients.length };
+}
+
+async function readAll(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+function openPart(c, env, identity, part) {
+  const r = spawnSync(c.age, ['-d', '-i', identity], { input: part, env, encoding: 'utf-8', maxBuffer: 16 * 1024 * 1024 });
+  if (r.error) throw new Fail(`can't run ${c.age}: ${r.error.message}`);
+  if (r.status !== 0) {
+    throw new Fail(`the part doesn't decrypt with LOOM_IMPORT_IDENTITY (${(r.stderr || '').trim().split('\n').pop()}). ` +
+      'Is it the key the bundle was made for? Nothing was written.');
+  }
+  let doc;
+  try { doc = JSON.parse(r.stdout); } catch { doc = null; }
+  if (!doc || doc.format !== PART_FORMAT || !doc.secrets || typeof doc.secrets !== 'object' || Array.isArray(doc.secrets)) {
+    throw new Fail(`the part decrypts but isn't a ${PART_FORMAT} part. Nothing was written.`);
+  }
+  for (const [name, value] of Object.entries(doc.secrets)) {
+    // Names only in messages, and only names that pass the rules.
+    if (!NAME.test(name)) throw new Fail('the part holds a name that fails the rules. Nothing was written.');
+    if (typeof value !== 'string' || value === '') throw new Fail(`the part's value for ${name} isn't a non-empty string. Nothing was written.`);
+  }
+  return doc.secrets;
+}
+
+async function importPart(c, env, io, force) {
+  const identity = env.LOOM_IMPORT_IDENTITY;
+  if (!identity) throw new Fail('refused: LOOM_IMPORT_IDENTITY is empty. Import needs the age identity the part was encrypted to.', 2);
+  if (!existsSync(identity)) throw new Fail(`refused: LOOM_IMPORT_IDENTITY names no file (${identity}).`, 2);
+  const held = names(c);
+  if (held.length > 0 && !force) {
+    throw new Fail(`refused: the store at ${c.store} already holds ${held.length} secret(s). ` +
+      'Restore is for a fresh machine; pass --force to replace the whole store with the part.', 3);
+  }
+  const part = await readAll(io.stdin);
+  if (part.length === 0) throw new Fail('refused: no part on stdin.', 2);
+  const secrets = openPart(c, env, identity, part);
+  // init semantics: a 0700 dir and this machine's own 0600 key, if there isn't one.
+  mkdirSync(c.dir, { recursive: true, mode: 0o700 });
+  chmodSync(c.dir, 0o700);
+  if (!existsSync(c.key)) { run(c.keygen, ['-o', c.key]); chmodSync(c.key, 0o600); io.stderr(`created age key ${c.key}\n`); }
+  withLock(c, () => {
+    if (names(c).length > 0 && !force) throw new Fail('refused: the store filled up while importing; nothing was written.', 3);
+    encrypt(c, env, secrets);
+  });
+  return Object.keys(secrets).length;
+}
+
 function revealAllowed(io) {
   return io.env.LOOM_SECRETS_ALLOW_GET === '1' || (io.stdinIsTTY && io.stdoutIsTTY);
 }
@@ -377,6 +478,29 @@ export async function main(argv, io) {
       if (sub === 'page') { io.stdout(JSON.stringify(uiPage(c, await readRequest(io))) + '\n'); return 0; }
       if (sub === 'act') { io.stdout(JSON.stringify(uiAct(c, io.env, await readRequest(io))) + '\n'); return 0; }
       throw new Fail(`unknown ui command ${sub}\n${USAGE}`, 2);
+    }
+
+    case 'bundle': {
+      // loom's bundle seam (household.md, "Export and restore"). Namespaced so
+      // it can't collide with another piece's own export/import.
+      const sub = pos[0];
+      if (sub === 'export') {
+        // stdout is the part and nothing else.
+        allow([]);
+        if (pos.length > 1) throw new Fail('usage: LOOM_EXPORT_RECIPIENTS=age1… loom-secrets bundle export', 2);
+        const { part, count, recipients } = exportPart(c, io.env);
+        io.stdout(part);
+        io.stderr(`exported ${count} secret(s), encrypted to ${recipients} recipient(s)\n`);
+        return 0;
+      }
+      if (sub === 'import') {
+        allow(['--force']);
+        if (pos.length > 1) throw new Fail('usage: LOOM_IMPORT_IDENTITY=<key file> loom-secrets bundle import [--force] < part', 2);
+        const count = await importPart(c, io.env, io, flags.has('--force'));
+        io.stderr(`imported ${count} secret(s) into ${c.store}, encrypted to this machine's key\n`);
+        return 0;
+      }
+      throw new Fail(`unknown bundle command ${sub ?? '(none)'}; it's bundle export or bundle import\n${USAGE}`, 2);
     }
 
     case 'list': {
