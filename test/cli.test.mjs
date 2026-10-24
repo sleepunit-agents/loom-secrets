@@ -23,7 +23,8 @@ before(() => {
   podmanLog = join(dir, 'podman.log');
   const fakePodman = join(dir, 'podman');
   // Records argv and stdin, the way `podman secret create --replace NAME -` gets them.
-  writeFileSync(fakePodman, `#!/bin/sh\necho "argv: $*" >> "${podmanLog}"\nprintf 'stdin: ' >> "${podmanLog}"; cat >> "${podmanLog}"; echo >> "${podmanLog}"\n`);
+  // Like real podman, refuses stdin that isn't a pipe (node's spawn input is a socketpair).
+  writeFileSync(fakePodman, `#!/bin/sh\n[ -p /dev/stdin ] || { echo "data must be passed into stdin" >&2; exit 125; }\necho "argv: $*" >> "${podmanLog}"\nprintf 'stdin: ' >> "${podmanLog}"; cat >> "${podmanLog}"; echo >> "${podmanLog}"\n`);
   chmodSync(fakePodman, 0o755);
   env = {
     PATH: process.env.PATH,

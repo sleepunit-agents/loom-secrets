@@ -230,7 +230,9 @@ export async function main(argv, io) {
       }
       const data = decrypt(c, io.env);
       if (!(pos[0] in data)) throw new Fail(`no secret named ${pos[0]}`, 3);
-      run(c.podman, ['secret', 'create', '--replace', pos[1], '-'], { input: data[pos[0]], env: io.env });
+      // podman, like sops, wants a real pipe on stdin, not node's socketpair.
+      run('sh', ['-c', 'cat | "$0" "$@"', c.podman, 'secret', 'create', '--replace', pos[1], '-'],
+        { input: data[pos[0]], env: io.env });
       io.stderr(`podman secret ${pos[1]} <- ${pos[0]}\n`);
       return 0;
     }
