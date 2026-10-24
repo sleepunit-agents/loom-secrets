@@ -1,0 +1,17 @@
+{
+  "name": "loom-secrets",
+  "version": "0.1.0",
+  "private": true,
+  "description": "loom's secrets piece: named secrets in a sops + age store; values never in argv, never printed to a body",
+  "type": "module",
+  "bin": {
+    "loom-secrets": "src/cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/cli.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "AGPL-3.0-or-later"
+}
