@@ -16,8 +16,9 @@ loom secrets rm google-pass
 ```
 
 Underneath it's [sops](https://github.com/getsops/sops) with an
-[age](https://github.com/FiloSottile/age) key. Both binaries must be on `PATH`, or
-named by `LOOM_SECRETS_SOPS` and `LOOM_SECRETS_AGE_KEYGEN`. The store is
+[age](https://github.com/FiloSottile/age) key. The binaries (`sops`, `age-keygen`,
+and `age` for the bundle verbs) must be on `PATH`, or named by
+`LOOM_SECRETS_SOPS`, `LOOM_SECRETS_AGE_KEYGEN` and `LOOM_SECRETS_AGE`. The store is
 `$LOOM_SECRETS_DIR/store.sops.json`, and `LOOM_SECRETS_DIR` defaults to
 `~/.config/loom-secrets`. The key is `age.key` beside it, or `SOPS_AGE_KEY_FILE`.
 
@@ -57,8 +58,23 @@ this implementation.
   stdin JSON. From there it goes the same way as `add`: to sops on stdin, never
   in argv, env, a log or a file left behind. It's checked like `add`: a name
   by the CLI's rules, a value non-empty and at most 64 KB.
-- **Exit codes**: 0 ok, 2 usage or refused input, 3 no such secret / already
-  exists (without `--force`), 4 reveal refused.
+- **ac-sec-export-encrypted**: `bundle export` writes a part that holds no
+  plaintext value (nor a name), encrypted only to the recipients in
+  `LOOM_EXPORT_RECIPIENTS`. It refuses with no recipients or a malformed one,
+  and never echoes a malformed one (it might be a pasted private key). It
+  prints no value or key; stdout is the part and nothing else.
+- **ac-sec-import-rekeys**: after `bundle import`, the store opens with this
+  machine's key and not the bundle's. The owner's identity is used only to
+  open the part.
+- **ac-sec-import-no-clobber**: `bundle import` refuses (exit 3) over a store
+  that holds secrets unless `--force`, and a part that doesn't open with
+  `LOOM_IMPORT_IDENTITY` writes nothing: no key, no store.
+- **ac-sec-bundle-no-disk**: on export and import the plaintext map moves
+  between sops and age through the piece's memory and their stdin/stdout,
+  never argv, env, a log or a file.
+- **Exit codes**: 0 ok, 1 a tool failed (a part that doesn't decrypt, sops or
+  age erroring), 2 usage or refused input, 3 no such secret / already exists
+  (without `--force`), 4 reveal refused.
 
 ## On loom's page
 
@@ -85,6 +101,46 @@ sign-in and anti-forgery token, and then to this piece on stdin. loom never
 logs it or stores it. A multi-line value (a JSON key, an `.env`) is easier to
 pipe in with `loom secrets add`.
 
+## In loom's bundle
+
+`loom export` and `loom restore` (loom's `docs/specs/household.md`, "Export
+and restore") carry this piece's part through two verbs under `bundle`:
+
+```bash
+LOOM_EXPORT_RECIPIENTS=age1…,age1… loom-secrets bundle export > secrets.part
+LOOM_IMPORT_IDENTITY=~/owner.key loom-secrets bundle import [--force] < secrets.part
+```
+
+**Why the part is re-encrypted.** The store is sops-encrypted to this box's
+`age.key`. If the box dies, that key goes with it. So `bundle export` decrypts
+the store and encrypts it again to the owner's recipients, and `bundle import`
+on a fresh machine opens it with the owner's identity and encrypts it to that
+machine's own key. loom never decrypts the part.
+
+**The part format** (`loom-secrets/1`) is an ASCII-armored age file,
+`age -e -a -r <each recipient>`, over the canonical JSON of the decrypted map,
+names sorted:
+
+```json
+{"format":"loom-secrets/1","secrets":{"<name>":"<value>"}}
+```
+
+No sops metadata travels, so a part opens with `age -d -i <identity>` alone.
+Recipients are `age1…` keys (X25519 or a plugin's, such as a YubiKey) or ssh
+public keys, comma-separated.
+
+- **`bundle export`** with no store writes a valid empty part
+  (`"secrets":{}`), so a restore lays down an empty store too. It creates
+  nothing on disk.
+- **`bundle import`** checks that `LOOM_IMPORT_IDENTITY` names a file,
+  decrypts and checks the part (format, names by the CLI's rules, non-empty
+  string values), and only then writes. If there's no key it makes one, the
+  same way `init` does (a 0700 dir, a 0600 key). It refuses over a store that
+  holds any secret unless `--force`; an empty store from `init` is fine.
+  `--force` replaces the whole store with the part, and keeps this machine's
+  key.
+- Any other `bundle <x>` is exit 2.
+
 ## Threat model: the gate is a guardrail, the key is the boundary
 
 The `get`/`podman` gate (a terminal, or `LOOM_SECRETS_ALLOW_GET=1`) stops a
@@ -103,6 +159,16 @@ The boundary is **who can read `age.key`**:
   host broker, so bodies have to go through a request the selvedge (or the
   approval piece) answers.
 
+### The bundle verbs
+
+`bundle export` isn't behind the `get` gate: loom runs it with no terminal and
+only `LOOM_EXPORT_RECIPIENTS` set. So a same-user process that can run this
+CLI can export the store to a recipient of its own and read it. That's the
+same reach it already has through `sops --decrypt` with the key, so it doesn't
+move the boundary, but it does skip the guardrail. In a tank nothing changes,
+because the key never enters one. `bundle import` is a writer, like the page:
+it can replace the store (with `--force`), not read it.
+
 ### The page
 
 The page adds a writer, not a reader. Whoever is signed in to loom's page can
@@ -117,7 +183,9 @@ value passes through, like the terminal you'd type it into.
 
 ## Not yet
 
-- Several recipients (a host key plus a recovery key) and key rotation.
+- Several recipients on the store itself (a host key plus a recovery key) and
+  key rotation. The bundle part (above) is a recovery copy to the owner's key,
+  but only as fresh as the last `loom export`.
 - An `exec`-style injection into a process's environment. That's left out on
   purpose: env is where the first tank turn leaked a token.
 - A seam to the approval piece, for "a body asks for a secret, a human says
