@@ -44,8 +44,46 @@ this implementation.
   is how a tank gets its keys: `house/tank` runs on the host side.
 - **ac-sec-loom-boundary**: the piece never reads or writes loom's stores.
   Secrets are authority, not continuity.
+- **ac-sec-ui-write-only**: loom's page can add, replace and remove a secret,
+  and nothing more. `ui act` has no action that reads, reveals or injects a
+  value; `get` and `podman` stay CLI-only behind their gate. Any other action
+  name is refused.
+- **ac-sec-ui-no-value-out**: no `ui` answer (manifest, page or action result)
+  ever holds a value. The page lists names only, a `secret` field never
+  carries a `value`, and an action's message names the secret, never the
+  value. A name that fails the rules isn't echoed back either, since whatever
+  was typed there might be a value.
+- **ac-sec-ui-stdin-only**: on the page a value arrives only in `ui act`'s
+  stdin JSON. From there it goes the same way as `add`: to sops on stdin, never
+  in argv, env, a log or a file left behind. It's checked like `add`: a name
+  by the CLI's rules, a value non-empty and at most 64 KB.
 - **Exit codes**: 0 ok, 2 usage or refused input, 3 no such secret / already
   exists (without `--force`), 4 reveal refused.
+
+## On loom's page
+
+The piece answers loom's page contract (v2, loom's `docs/extensions.md`, "The
+page"). It gets a **Secrets** tab and a Home tile with the count and whether
+the key is on this host.
+
+```bash
+loom-secrets ui --json         # manifest: tab, tile; no asks
+echo '{"path":"","query":{}}' | loom-secrets ui page --json
+echo '{"action":"add","path":"","fields":{"name":"x","value":"..."}}' | loom-secrets ui act --json
+```
+
+The page (`""`) has an **Add a secret** form and **In the store**, which lists
+names. Each name folds open to a **Replace** form and a **Remove** button.
+`ui act` takes `add` (refuses a name that exists and points to Replace),
+`replace` (the name must exist) and `remove`. It answers
+`{ok, message, page: ""}`. A store bigger than one page allows (160 names) is
+split into parts, picked with `?part=`.
+
+The page is **write-only**: you can put a value in, but you can't read it back
+(ac-sec-ui-*). A value typed into the form goes to loom, which checks the
+sign-in and anti-forgery token, and then to this piece on stdin. loom never
+logs it or stores it. A multi-line value (a JSON key, an `.env`) is easier to
+pipe in with `loom secrets add`.
 
 ## Threat model: the gate is a guardrail, the key is the boundary
 
@@ -64,6 +102,18 @@ The boundary is **who can read `age.key`**:
   The step that would cover it: keep the key under a separate user or a
   host broker, so bodies have to go through a request the selvedge (or the
   approval piece) answers.
+
+### The page
+
+The page adds a writer, not a reader. Whoever is signed in to loom's page can
+**add, replace or remove** a secret. Because of that, the page is worth
+guarding the way the host is. A replace or remove can break a body's
+credentials. It can't leak them, though. The page has no way to read a value,
+so a stolen session, a forged form or a script on the page gets nothing out of
+the store. (loom renders data, never a piece's markup, and the page runs no
+script.) The value in a form crosses loom-http, which passes it on stdin
+without logging or keeping it. That makes loom-http's process a place the
+value passes through, like the terminal you'd type it into.
 
 ## Not yet
 
