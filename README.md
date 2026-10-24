@@ -126,6 +126,15 @@ names sorted:
 ```
 
 No sops metadata travels, so a part opens with `age -d -i <identity>` alone.
+
+**A part is encrypted, not signed.** age proves who can read a part, not who
+made it. Anyone holding the owner's *public* recipient could build a part, so
+`bundle import` trusts what it's given: only import a part from a bundle you
+made yourself. It can't be signed at export time in a way that survives the
+case it's for. The exporting box's key is the thing that's gone after the
+apocalypse, and only the owner's public key is present when exporting.
+Importing also takes a deliberate step: running it with the owner's private
+identity in hand.
 Recipients are `age1…` keys (X25519 or a plugin's, such as a YubiKey) or ssh
 public keys, comma-separated.
 
