@@ -283,6 +283,14 @@ test('ui act remove removes, and refuses a missing name', { skip }, () => {
   assert.match(again.message, /no secret named b.second/);
 });
 
+test('names that match Object.prototype keys are ordinary names', { skip }, () => {
+  // `name in data` would see an inherited constructor and call it taken.
+  assert.equal(act('add', { name: 'constructor', value: 'v1' }).ok, true);
+  assert.equal(act('replace', { name: 'toString', value: 'v2' }).ok, false);
+  assert.equal(act('remove', { name: 'constructor' }).ok, true);
+  assert.equal(act('remove', { name: 'hasOwnProperty' }).ok, false);
+});
+
 test('a big store stays inside loom\'s limits: 20 rows a section, 10 sections, parts beyond that', { skip }, () => {
   // Fake names straight into a scratch store: names() reads keys without decrypting.
   const d = join(dir, 'ui-big');

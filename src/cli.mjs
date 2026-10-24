@@ -129,8 +129,8 @@ function put(c, env, name, value, mode) {
   checkName(name);
   withLock(c, () => {
     const data = decrypt(c, env);
-    if (mode === 'new' && name in data) throw new Fail(`${name} already exists (pass --force to replace it)`, 3);
-    if (mode === 'existing' && !(name in data)) throw new Fail(`no secret named ${name}`, 3);
+    if (mode === 'new' && Object.hasOwn(data, name)) throw new Fail(`${name} already exists (pass --force to replace it)`, 3);
+    if (mode === 'existing' && !Object.hasOwn(data, name)) throw new Fail(`no secret named ${name}`, 3);
     data[name] = value;
     encrypt(c, env, data);
   });
@@ -140,7 +140,7 @@ function remove(c, env, name) {
   checkName(name);
   withLock(c, () => {
     const data = decrypt(c, env);
-    if (!(name in data)) throw new Fail(`no secret named ${name}`, 3);
+    if (!Object.hasOwn(data, name)) throw new Fail(`no secret named ${name}`, 3);
     delete data[name];
     encrypt(c, env, data);
   });
@@ -403,7 +403,7 @@ export async function main(argv, io) {
           'A body gets secrets injected into its runtime, not read out of the store.', 4);
       }
       const data = decrypt(c, io.env);
-      if (!(pos[0] in data)) throw new Fail(`no secret named ${pos[0]}`, 3);
+      if (!Object.hasOwn(data, pos[0])) throw new Fail(`no secret named ${pos[0]}`, 3);
       io.stdout(data[pos[0]] + (io.stdoutIsTTY ? '\n' : ''));
       return 0;
     }
@@ -418,7 +418,7 @@ export async function main(argv, io) {
         throw new Fail('refused: podman injection is host-side only (an interactive terminal, or LOOM_SECRETS_ALLOW_GET=1 from the host side).', 4);
       }
       const data = decrypt(c, io.env);
-      if (!(pos[0] in data)) throw new Fail(`no secret named ${pos[0]}`, 3);
+      if (!Object.hasOwn(data, pos[0])) throw new Fail(`no secret named ${pos[0]}`, 3);
       // podman, like sops, wants a real pipe on stdin, not node's socketpair.
       run('sh', ['-c', 'cat | "$0" "$@"', c.podman, 'secret', 'create', '--replace', pos[1], '-'],
         { input: data[pos[0]], env: io.env });
