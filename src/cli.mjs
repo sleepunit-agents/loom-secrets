@@ -9,7 +9,11 @@
 //   - `list` never decrypts; nothing prints a value unless `get --reveal` is
 //     allowed (an interactive terminal, or LOOM_SECRETS_ALLOW_GET=1 set by the
 //     host side, e.g. the selvedge); a body is refused by default
-//   - `podman` injects a value into a podman secret without printing it
+//   - `podman` injects a value into a podman secret without printing it,
+//     behind the same gate as `get --reveal`
+//   - the gate is a guardrail, not a boundary: a same-user process that can
+//     read the age key can run sops itself. The boundary is where the key
+//     lives (README, "Threat model").
 //   - it never touches loom's stores
 import { spawnSync } from 'node:child_process';
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -219,6 +223,11 @@ export async function main(argv, io) {
       allow([]);
       checkName(pos[0]);
       if (!pos[1] || !NAME.test(pos[1])) throw new Fail('usage: loom secrets podman <name> <podman-secret-name>', 2);
+      // The same gate as get --reveal: with $LOOM_SECRETS_PODMAN pointing at
+      // `cat`, injection is just another way to print the value.
+      if (!revealAllowed(io)) {
+        throw new Fail('refused: podman injection is host-side only (an interactive terminal, or LOOM_SECRETS_ALLOW_GET=1 from the host side).', 4);
+      }
       const data = decrypt(c, io.env);
       if (!(pos[0] in data)) throw new Fail(`no secret named ${pos[0]}`, 3);
       run(c.podman, ['secret', 'create', '--replace', pos[1], '-'], { input: data[pos[0]], env: io.env });

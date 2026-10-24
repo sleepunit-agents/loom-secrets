@@ -91,8 +91,14 @@ test('get refuses a body by default (no terminal, no host allowance), and withou
   assert.equal(cli(['get', 'google-pass'], { extraEnv: { LOOM_SECRETS_ALLOW_GET: '1' } }).status, 2);
 });
 
+test('podman is gated like get --reveal (else LOOM_SECRETS_PODMAN=cat would print the value)', { skip }, () => {
+  const r = cli(['podman', 'google-pass', 'x'], { extraEnv: { LOOM_SECRETS_PODMAN: 'cat' } });
+  assert.equal(r.status, 4);
+  assert.equal(r.stdout, '');
+});
+
 test('podman injects the value over stdin, never argv, and prints nothing', { skip }, () => {
-  const r = cli(['podman', 'google-pass', 'art-google-pass']);
+  const r = cli(['podman', 'google-pass', 'art-google-pass'], { extraEnv: { LOOM_SECRETS_ALLOW_GET: '1' } });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.stdout, '');
   const log = readFileSync(podmanLog, 'utf-8');
