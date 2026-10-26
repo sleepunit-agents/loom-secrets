@@ -191,9 +191,7 @@ const NAME_HINT = 'Letters, digits, dot, dash and underscore. It starts with a l
   'The name is the only part anyone sees again.';
 const MAX_VALUE = 64 * 1024;          // bytes, as loom's own cap on a post
 const MAX_REQUEST = 1024 * 1024;      // stdin JSON for page/act
-const PER_SECTION = 20;               // loom: 20 blocks a section
-const NAME_SECTIONS = 8;              // loom: 10 sections a page; 1 for the form, 1 for the part picker
-const PER_PART = PER_SECTION * NAME_SECTIONS;
+const PER_PART = 200;                 // loom: 200 rows a list
 const NOT_FOUND = { title: 'Not found', sections: [] };
 
 /** stdin JSON for `ui page` / `ui act`. Anything unreadable comes back as null. */
@@ -228,7 +226,9 @@ function uiManifest(c) {
 }
 
 function uiPage(c, req) {
-  if (!req || req.path !== '') return NOT_FOUND;
+  if (!req || typeof req.path !== 'string') return NOT_FOUND;
+  if (req.path.startsWith('secret/')) return secretPage(c, req.path.slice('secret/'.length));
+  if (req.path !== '') return NOT_FOUND;
   const query = req.query && typeof req.query === 'object' ? req.query : {};
   const all = names(c);
   const keyed = existsSync(c.key);
@@ -237,37 +237,22 @@ function uiPage(c, req) {
   if (part > parts) part = 1;
   const shown = all.slice((part - 1) * PER_PART, part * PER_PART);
 
-  const top = [
-    { type: 'stats', items: [
-      { label: 'Stored', value: String(all.length) },
-      { label: 'Key', value: keyed ? 'On this host' : 'Missing', tone: keyed ? 'ok' : 'bad' },
-    ] },
-  ];
-  if (!keyed) top.push({ type: 'callout', tone: 'bad', title: 'No age key',
-    text: `There is no age key at ${c.key}, so nothing can be stored. Run: loom secrets init` });
-  top.push({
-    type: 'form', title: 'Add a secret', action: 'add', submit: 'Encrypt and save',
-    note: 'The value goes from this form to the secrets piece on stdin and into the encrypted store. ' +
-      'loom never logs or keeps it, and it is never shown here again.',
+  // The board's order: what's stored (each a row: tap it to replace or remove it), then Add a secret.
+  const sections = [];
+  if (!keyed) sections.push({ id: 'key', blocks: [{ type: 'callout', tone: 'bad', title: 'No age key',
+    text: `There is no age key at ${c.key}, so nothing can be stored. Run: loom secrets init` }] });
+  sections.push({ id: 'store', blocks: shown.length
+    ? [{ type: 'list', items: shown.map((name) => ({ text: name, page: `secret/${name}` })) }]
+    : [{ type: 'text', tone: 'muted', text: 'Nothing stored yet.' }] });
+  sections.push({ id: 'add', title: 'Add a secret', blocks: [{
+    type: 'form', action: 'add', submit: 'Save',
+    note: 'The value goes straight to the secrets piece and into the encrypted store. It is never shown here again.',
     fields: [
       { name: 'name', label: 'Name', kind: 'text', hint: NAME_HINT, required: true },
       { name: 'value', label: 'Value', kind: 'secret', required: true,
         hint: 'One line, 64 KB at most. For a multi-line value (a JSON key, an .env), pipe it in: loom secrets add <name>' },
     ],
-  });
-  const sections = [{ id: 'add', blocks: top }];
-
-  if (shown.length === 0) {
-    sections.push({ id: 'store', title: 'In the store', blocks: [{ type: 'text', tone: 'muted', text: 'Nothing stored yet.' }] });
-  }
-  for (let i = 0; i < shown.length; i += PER_SECTION) {
-    const first = i === 0;
-    sections.push({
-      id: first ? 'store' : `store-${i / PER_SECTION + 1}`,
-      ...(first ? { title: 'In the store' } : {}),
-      blocks: shown.slice(i, i + PER_SECTION).map(nameRow),
-    });
-  }
+  }] });
   if (parts > 1) {
     const options = [];
     for (let p = 1; p <= parts; p++) {
@@ -280,22 +265,24 @@ function uiPage(c, req) {
   }
   return {
     title: 'Secrets',
-    intro: 'Encrypted at rest with sops and age. Bodies get them injected when they start. ' +
-      'You can add, replace and remove them here, but there is no way to read one back.',
+    intro: `${all.length} stored, ${keyed ? 'key on this host' : 'no key'}. Write-only: bodies get them when they start, and there is no way to read one back.`,
     sections,
   };
 }
 
-/** One stored name: folded, with a Replace form and a Remove button inside. Never a value. */
-function nameRow(name) {
+/** One stored name: a Replace form and a Remove button. Never a value. */
+function secretPage(c, name) {
+  if (!NAME.test(name) || !names(c).includes(name)) return NOT_FOUND;
   return {
-    type: 'details', summary: name,
-    blocks: [
-      { type: 'form', title: `Replace ${name}`, action: 'replace', submit: 'Replace', hidden: { name },
-        note: 'The old value is overwritten. It is not shown, here or anywhere on this page.',
+    title: name,
+    intro: 'Write-only: its value is never shown, here or anywhere on this page.',
+    sections: [{ id: 'secret', blocks: [
+      { type: 'form', title: 'Replace', action: 'replace', submit: 'Replace', hidden: { name },
+        note: 'The old value is overwritten. Bodies pick up the new one the next time they start.',
         fields: [{ name: 'value', label: 'New value', kind: 'secret', required: true }] },
-      { type: 'buttons', items: [{ action: 'remove', label: 'Remove', tone: 'danger', fields: { name } }] },
-    ],
+      { type: 'buttons', items: [{ action: 'remove', label: 'Remove', tone: 'danger', fields: { name },
+        confirm: `Bodies started after this won't get ${name}.` }] },
+    ] }],
   };
 }
 
