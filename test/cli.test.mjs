@@ -145,8 +145,8 @@ const ui = (args, req, extra = {}) => {
 const page = (path = '', query = {}) => ui(['page'], { path, query });
 const act = (action, fields, path = '') => ui(['act'], { action, path, fields });
 const blocksOf = (p, id) => p.sections.find((s) => s.id === id)?.blocks ?? [];
-const storeNames = (p) => p.sections.filter((s) => s.id.startsWith('store'))
-  .flatMap((s) => s.blocks).filter((b) => b.type === 'details').map((b) => b.summary);
+const storeNames = (p) => p.sections.filter((s) => s.id === 'store')
+  .flatMap((s) => s.blocks).filter((b) => b.type === 'list').flatMap((b) => b.items.map((i) => i.text));
 
 before(() => {
   if (skip) return;
@@ -173,13 +173,14 @@ test('ui --json is a v2 manifest: a Secrets tab, a count tile with the key state
   assert.equal(nokey.tile.tone, 'bad');
 });
 
-test('ui page "": an intro, the Add form (text name, secret value), an empty store', { skip }, () => {
+test('ui page "": an intro, what\'s stored first, then the Add form (text name, secret value)', { skip }, () => {
   const p = page();
   assert.equal(p.title, 'Secrets');
   assert.match(p.intro, /no way to read one back/);
+  assert.deepEqual(p.sections.map((s) => s.id), ['store', 'add']);
+  assert.equal(p.sections[1].title, 'Add a secret');
   const form = blocksOf(p, 'add').find((b) => b.type === 'form');
   assert.equal(form.action, 'add');
-  assert.equal(form.title, 'Add a secret');
   const [name, value] = form.fields;
   assert.equal(name.name, 'name');
   assert.equal(name.kind, 'text');
@@ -207,17 +208,20 @@ test('ui act add stores the value from stdin JSON; the message names it, never t
   assert.equal(ui([]).tile.value, '2');
 });
 
-test('ui page lists names only, each with a Replace form and a Remove button', { skip }, () => {
+test('ui page lists names only, each a row to its own page: a Replace form and a Remove that asks first', { skip }, () => {
   const p = page();
   assert.deepEqual(storeNames(p), ['b.second', 'example-token']);
-  const row = blocksOf(p, 'store').find((b) => b.summary === 'example-token');
-  const [form, buttons] = row.blocks;
+  assert.deepEqual(blocksOf(p, 'store')[0].items[1], { text: 'example-token', page: 'secret/example-token' });
+  const one = page('secret/example-token');
+  assert.equal(one.title, 'example-token');
+  const [form, buttons] = one.sections[0].blocks;
   assert.equal(form.type, 'form');
   assert.equal(form.action, 'replace');
-  assert.equal(form.title, 'Replace example-token');
   assert.deepEqual(form.hidden, { name: 'example-token' });
   assert.deepEqual(form.fields.map((f) => [f.name, f.kind, 'value' in f]), [['value', 'secret', false]]);
-  assert.deepEqual(buttons, { type: 'buttons', items: [{ action: 'remove', label: 'Remove', tone: 'danger', fields: { name: 'example-token' } }] });
+  assert.deepEqual(buttons.items.map((b) => [b.action, b.label, b.tone, b.fields.name, typeof b.confirm]), [['remove', 'Remove', 'danger', 'example-token', 'string']]);
+  assert.deepEqual(page('secret/not-there'), { title: 'Not found', sections: [] });
+  assert.deepEqual(page('secret/../x'), { title: 'Not found', sections: [] });
 });
 
 test('ui act add refuses an existing name and points to Replace', { skip }, () => {
@@ -291,7 +295,7 @@ test('names that match Object.prototype keys are ordinary names', { skip }, () =
   assert.equal(act('remove', { name: 'hasOwnProperty' }).ok, false);
 });
 
-test('a big store stays inside loom\'s limits: 20 rows a section, 10 sections, parts beyond that', { skip }, () => {
+test('a big store stays inside loom\'s limits: 200 rows a list, parts beyond that', { skip }, () => {
   // Fake names straight into a scratch store: names() reads keys without decrypting.
   const d = join(dir, 'ui-big');
   execFileSync('mkdir', ['-p', d]);
@@ -302,13 +306,13 @@ test('a big store stays inside loom\'s limits: 20 rows a section, 10 sections, p
   const p1 = ui(['page'], { path: '', query: {} }, extra);
   assert.ok(p1.sections.length <= 10);
   for (const s of p1.sections) assert.ok(s.blocks.length <= 20);
-  assert.equal(storeNames(p1).length, 160);
+  assert.equal(storeNames(p1).length, 200);
   const parts = p1.sections.find((s) => s.id === 'parts');
   assert.equal(parts.side, true);
   assert.deepEqual(parts.blocks[0].options.map((o) => o.value), ['', '2']);
   const p2 = ui(['page'], { path: '', query: { part: '2' } }, extra);
-  assert.equal(storeNames(p2).length, 45);
-  assert.equal(storeNames(p2)[0], 'n160');
+  assert.equal(storeNames(p2).length, 5);
+  assert.equal(storeNames(p2)[0], 'n200');
   assert.equal(storeNames(ui(['page'], { path: '', query: { part: '99' } }, extra))[0], 'n000');
   assert.ok(Buffer.byteLength(JSON.stringify(p1)) < 512 * 1024);
 });
