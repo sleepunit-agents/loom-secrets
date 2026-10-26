@@ -227,9 +227,10 @@ function uiManifest(c) {
 
 function uiPage(c, req) {
   if (!req || typeof req.path !== 'string') return NOT_FOUND;
-  if (req.path.startsWith('secret/')) return secretPage(c, req.path.slice('secret/'.length));
-  if (req.path !== '') return NOT_FOUND;
   const query = req.query && typeof req.query === 'object' ? req.query : {};
+  // A name rides in the query: loom's page paths are lowercase, and names needn't be.
+  if (req.path === 'secret') return secretPage(c, String(query.name ?? ''));
+  if (req.path !== '') return NOT_FOUND;
   const all = names(c);
   const keyed = existsSync(c.key);
   const parts = Math.max(1, Math.ceil(all.length / PER_PART));
@@ -242,7 +243,7 @@ function uiPage(c, req) {
   if (!keyed) sections.push({ id: 'key', blocks: [{ type: 'callout', tone: 'bad', title: 'No age key',
     text: `There is no age key at ${c.key}, so nothing can be stored. Run: loom secrets init` }] });
   sections.push({ id: 'store', blocks: shown.length
-    ? [{ type: 'list', items: shown.map((name) => ({ text: name, page: `secret/${name}` })) }]
+    ? [{ type: 'list', items: shown.map((name) => ({ text: name, page: `secret?name=${encodeURIComponent(name)}` })) }]
     : [{ type: 'text', tone: 'muted', text: 'Nothing stored yet.' }] });
   sections.push({ id: 'add', title: 'Add a secret', blocks: [{
     type: 'form', action: 'add', submit: 'Save',

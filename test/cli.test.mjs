@@ -211,8 +211,8 @@ test('ui act add stores the value from stdin JSON; the message names it, never t
 test('ui page lists names only, each a row to its own page: a Replace form and a Remove that asks first', { skip }, () => {
   const p = page();
   assert.deepEqual(storeNames(p), ['b.second', 'example-token']);
-  assert.deepEqual(blocksOf(p, 'store')[0].items[1], { text: 'example-token', page: 'secret/example-token' });
-  const one = page('secret/example-token');
+  assert.deepEqual(blocksOf(p, 'store')[0].items[1], { text: 'example-token', page: 'secret?name=example-token' });
+  const one = page('secret', { name: 'example-token' });
   assert.equal(one.title, 'example-token');
   const [form, buttons] = one.sections[0].blocks;
   assert.equal(form.type, 'form');
@@ -220,8 +220,14 @@ test('ui page lists names only, each a row to its own page: a Replace form and a
   assert.deepEqual(form.hidden, { name: 'example-token' });
   assert.deepEqual(form.fields.map((f) => [f.name, f.kind, 'value' in f]), [['value', 'secret', false]]);
   assert.deepEqual(buttons.items.map((b) => [b.action, b.label, b.tone, b.fields.name, typeof b.confirm]), [['remove', 'Remove', 'danger', 'example-token', 'string']]);
-  assert.deepEqual(page('secret/not-there'), { title: 'Not found', sections: [] });
-  assert.deepEqual(page('secret/../x'), { title: 'Not found', sections: [] });
+  assert.deepEqual(page('secret', { name: 'not-there' }), { title: 'Not found', sections: [] });
+  assert.deepEqual(page('secret', { name: '../x' }), { title: 'Not found', sections: [] });
+  assert.deepEqual(page('secret/example-token'), { title: 'Not found', sections: [] });
+  // Names with capitals (loom's page paths are lowercase) ride in the query.
+  assert.equal(act('add', { name: 'Upper.CASE', value: 'v-up' }).ok, true);
+  assert.equal(blocksOf(page(), 'store')[0].items.find((i) => i.text === 'Upper.CASE').page, 'secret?name=Upper.CASE');
+  assert.equal(page('secret', { name: 'Upper.CASE' }).title, 'Upper.CASE');
+  assert.equal(act('remove', { name: 'Upper.CASE' }).ok, true);
 });
 
 test('ui act add refuses an existing name and points to Replace', { skip }, () => {
