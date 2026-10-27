@@ -580,6 +580,13 @@ test('requests: the policy grants (auto, for the agents it names), refuses (neve
   assert.equal(st[0].minutes, 30);
   // auto is for the agents it names: art asks instead.
   assert.match(api(house('h-21', 'art'), ['request', 'mark-discord', '--why', 'curious']).body.stdout, /asked the owner/);
+  // A grant is the whole caller's: the same house id under another agent, or another service, has nothing.
+  assert.equal(api(house('h-20', 'art'), ['get', 'mark-discord']).status, 403);
+  assert.equal(api({ ...house('h-20', 'mark'), service: 'discord' }, ['get', 'mark-discord']).status, 403);
+  // And the policy is read again at every get: moved to never, a live grant stops working at once.
+  writeFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), JSON.stringify({ v: 1, default: 'ask', secrets: {
+    'mark-discord': { grant: 'never' }, 'root-ssh': { grant: 'never' } } }));
+  assert.equal(api(house('h-20', 'mark'), ['get', 'mark-discord']).status, 403);
   const no = api(house('h-20', 'mark'), ['request', 'root-ssh', '--why', 'please']);
   assert.equal(no.body.exit, 1);
   assert.match(no.body.stdout, /denied/);

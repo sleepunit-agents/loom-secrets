@@ -93,6 +93,8 @@ function audit(c, event) {
   appendFileSync(paths(c).audit, JSON.stringify({ at: new Date().toISOString(), ...event }) + '\n', { mode: 0o600 });
 }
 
+/** A request is the whole caller's: its agent, its house, and its service if it has one. */
+const sameCaller = (r, h) => r.house === h.house && r.agent === h.agent && (r.service ?? null) === (h.service ?? null);
 const live = (r, now = Date.now()) => r.state === 'granted' && Date.parse(r.expires) > now;
 const view = (r) => ({ id: r.id, secret: r.secret, agent: r.agent, house: r.house, state: live(r) ? 'granted' : r.state === 'granted' ? 'expired' : r.state, why: r.why, minutes: r.minutes, at: r.at, ...(r.expires ? { expires: r.expires } : {}) });
 
@@ -116,7 +118,7 @@ export function request(c, caller, { secret, why, minutes }, known) {
   return locked(c, () => {
     const d = load(c);
     // Asking again gets the same request: one card on the page, not one an ask.
-    const same = Object.values(d.requests).find((r) => r.house === h.house && r.secret === secret && (r.state === 'pending' || live(r)));
+    const same = Object.values(d.requests).find((r) => sameCaller(r, h) && r.secret === secret && (r.state === 'pending' || live(r)));
     if (same) return view(same);
     const r = { id: 'q-' + randomBytes(4).toString('hex'), secret, agent: h.agent, house: h.house, ...(h.service ? { service: h.service } : {}),
       why: reason, minutes: want, at: new Date().toISOString(), state: 'pending' };
@@ -133,8 +135,10 @@ export function request(c, caller, { secret, why, minutes }, known) {
 export function mayRead(c, caller, secret) {
   const h = houseOf(caller);
   const d = load(c);
-  const mine = Object.values(d.requests).filter((r) => r.house === h.house && r.secret === secret);
-  const ok = mine.find((r) => live(r));
+  const mine = Object.values(d.requests).filter((r) => sameCaller(r, h) && r.secret === secret);
+  // The policy again, now: a secret moved to never stops being read at once, grant or not.
+  const now = decide(readPolicy(c), h.agent, secret);
+  const ok = now.level === 'never' ? undefined : mine.find((r) => live(r));
   if (ok) { audit(c, { event: 'read', id: ok.id, secret, agent: h.agent, house: h.house }); return ok; }
   const pending = mine.find((r) => r.state === 'pending');
   audit(c, { event: 'refused-read', secret, agent: h.agent, house: h.house });
@@ -146,7 +150,7 @@ export function mayRead(c, caller, secret) {
 /** This house's requests, newest first (no values). */
 export function mine(c, caller) {
   const h = houseOf(caller);
-  return Object.values(load(c).requests).filter((r) => r.house === h.house).sort((a, b) => (b.at > a.at ? 1 : -1)).map(view);
+  return Object.values(load(c).requests).filter((r) => sameCaller(r, h)).sort((a, b) => (b.at > a.at ? 1 : -1)).map(view);
 }
 
 export function all(c) {
