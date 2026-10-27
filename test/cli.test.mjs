@@ -177,7 +177,7 @@ test('ui page "": an intro, what\'s stored first, then the Add form (text name, 
   const p = page();
   assert.equal(p.title, 'Secrets');
   assert.match(p.intro, /no way to read one back/);
-  assert.deepEqual(p.sections.map((s) => s.id), ['store', 'add']);
+  assert.deepEqual(p.sections.map((s) => s.id), ['store', 'add', 'policy']);
   assert.equal(p.sections[1].title, 'Add a secret');
   const form = blocksOf(p, 'add').find((b) => b.type === 'form');
   assert.equal(form.action, 'add');
@@ -512,4 +512,83 @@ test('no value ever reached sops or age argv or env during export and import', {
   for (const v of Object.values(BUNDLE_VALUES)) {
     for (const line of v.split('\n').filter(Boolean)) assert.ok(!log.includes(line), `a value reached argv or env: ${line.slice(0, 3)}...`);
   }
+});
+
+// ---- requests (README, "Requests") ------------------------------------------
+// A house asks for a secret it doesn't carry. The policy grants it (auto),
+// refuses it (never), or asks the owner (the default): a card with Allow and
+// Deny on loom's page. A grant is one house's, for minutes, and `get` reads
+// the value for that house only.
+
+const api = (caller, argv) => {
+  const r = cli(['api', '--json'], { input: JSON.stringify({ caller, path: 'run', body: { argv } }) });
+  assert.equal(r.status, 0, r.stderr);
+  return JSON.parse(r.stdout);
+};
+const house = (h, agent = 'art') => ({ kind: 'agent', agent, house: h });
+
+test('requests: ask by default, the owner allows on the page, and only that house reads it', { skip }, () => {
+  cli(['init']);
+  cli(['add', 'onterris-gh'], { input: 'ghp_ONTERRIS_VALUE' });
+  // Not a house: an agent's plain token, the owner, a box: refused.
+  for (const c of [{ kind: 'agent', agent: 'art' }, { kind: 'owner' }, { kind: 'piece', subject: 'thor' }]) {
+    assert.equal(api(c, ['request', 'onterris-gh', '--why', 'x']).status, 403);
+  }
+  assert.equal(api(house('h-7'), ['request', 'nope', '--why', 'x']).status, 404);
+  assert.match(api(house('h-7'), ['request', 'onterris-gh']).body.stderr, /--why/);
+  const asked = api(house('h-7'), ['request', 'onterris-gh', '--why', 'push the fix for onterris/pond#212 <b>now</b>']);
+  assert.match(asked.body.stdout, /asked the owner/);
+  // Asking again is the same request: one card.
+  api(house('h-7'), ['request', 'onterris-gh', '--why', 'again']);
+  const m = JSON.parse(cli(['ui', '--json']).stdout);
+  assert.equal(m.asks.length, 1);
+  const ask = m.asks[0];
+  assert.match(ask.text, /art asks for onterris-gh/);
+  assert.match(ask.meta, /h-7.*push the fix for onterris\/pond#212 b now \/b/);
+  assert.deepEqual(ask.actions.map((a) => a.action), ['grant', 'deny']);
+  // Waiting: no value yet.
+  assert.equal(api(house('h-7'), ['get', 'onterris-gh']).status, 403);
+  const act = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'grant', fields: ask.actions[0].fields }) }).stdout);
+  assert.equal(act.ok, true, act.message);
+  assert.equal(JSON.parse(cli(['ui', '--json']).stdout).asks.length, 0);
+  const got = api(house('h-7'), ['get', 'onterris-gh']);
+  assert.equal(got.body.stdout, 'ghp_ONTERRIS_VALUE');
+  // Another house of the same agent has nothing.
+  assert.equal(api(house('h-8'), ['get', 'onterris-gh']).status, 403);
+  // The page never carries the value; the owner can revoke.
+  const page = cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }) }).stdout;
+  assert.ok(!page.includes('ghp_ONTERRIS_VALUE'));
+  const live = JSON.parse(page).sections.find((s) => s.id === 'requests').blocks[0].items[0];
+  assert.equal(live.act.action, 'revoke');
+  cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'revoke', fields: live.act.fields }) });
+  assert.equal(api(house('h-7'), ['get', 'onterris-gh']).status, 403);
+  // Every step is on the record.
+  const audit = readFileSync(join(env.LOOM_SECRETS_DIR, 'audit.jsonl'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l).event);
+  assert.deepEqual(audit, ['request', 'refused-read', 'grant', 'read', 'refused-read', 'revoke', 'refused-read']);
+  assert.ok(!readFileSync(join(env.LOOM_SECRETS_DIR, 'audit.jsonl'), 'utf-8').includes('ghp_ONTERRIS_VALUE'));
+});
+
+test('requests: the policy grants (auto, for the agents it names), refuses (never), and caps the minutes', { skip }, () => {
+  cli(['add', 'mark-discord'], { input: 'DISCORD' });
+  cli(['add', 'root-ssh'], { input: 'SSH' });
+  writeFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), JSON.stringify({ v: 1, default: 'ask', secrets: {
+    'mark-discord': { grant: 'auto', agents: ['mark'], minutes: 30 }, 'root-ssh': { grant: 'never' } } }));
+  const g = api(house('h-20', 'mark'), ['request', 'mark-discord', '--why', 'bridge', '--minutes', '999']);
+  assert.match(g.body.stdout, /granted/);
+  assert.equal(api(house('h-20', 'mark'), ['get', 'mark-discord']).body.stdout, 'DISCORD');
+  const st = JSON.parse(api(house('h-20', 'mark'), ['status']).body.stdout);
+  assert.equal(st[0].minutes, 30);
+  // auto is for the agents it names: art asks instead.
+  assert.match(api(house('h-21', 'art'), ['request', 'mark-discord', '--why', 'curious']).body.stdout, /asked the owner/);
+  // A grant is the whole caller's: the same house id under another agent, or another service, has nothing.
+  assert.equal(api(house('h-20', 'art'), ['get', 'mark-discord']).status, 403);
+  assert.equal(api({ ...house('h-20', 'mark'), service: 'discord' }, ['get', 'mark-discord']).status, 403);
+  // And the policy is read again at every get: moved to never, a live grant stops working at once.
+  writeFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), JSON.stringify({ v: 1, default: 'ask', secrets: {
+    'mark-discord': { grant: 'never' }, 'root-ssh': { grant: 'never' } } }));
+  assert.equal(api(house('h-20', 'mark'), ['get', 'mark-discord']).status, 403);
+  const no = api(house('h-20', 'mark'), ['request', 'root-ssh', '--why', 'please']);
+  assert.equal(no.body.exit, 1);
+  assert.match(no.body.stdout, /denied/);
+  assert.equal(api(house('h-20', 'mark'), ['get', 'root-ssh']).status, 403);
 });
