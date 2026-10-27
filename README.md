@@ -101,6 +101,47 @@ sign-in and anti-forgery token, and then to this piece on stdin. loom never
 logs it or stores it. A multi-line value (a JSON key, an `.env`) is easier to
 pipe in with `loom secrets add`.
 
+## Requests: a house asks, the owner says yes
+
+A house can ask for a secret it wasn't started with, say *what it's for*,
+and get it for a while if the policy allows it or the owner says yes on
+loom's page. A rarely needed, powerful credential (an owner's GitHub token
+for one org's pushes) then lives in no house until one asks, and nobody
+reads it without the owner knowing.
+
+```
+house:  piece-call secrets request onterris-gh --why "push the fix for onterris/pond#212"
+loom:   POST /api/secrets/run, as the house's own token (agent:art@h-104)
+piece:  policy.json says auto (granted), never (refused), or, by default, ask:
+        a card on loom's Home with Allow and Deny, pushed to the owner's phone
+house:  piece-call secrets get onterris-gh        (works once granted, for that house only)
+```
+
+- **Only a house asks or reads:** its token names it (loom: `agent:<a>[/<service>]@<house>`).
+  A grant is that house's, for `minutes` (60 unless the policy says, 8 h at
+  most). It ends with the house, since the house's token is revoked when the
+  house is over.
+- **The policy decides auto and never; the reason never does.** The reason a
+  house gives is its own words, written by a body that may be steered, so
+  it's shown to the owner and decides nothing. `policy.json` in the store's
+  directory:
+
+  ```json
+  {"v":1,"default":"ask","secrets":{
+    "mark-discord-token":{"grant":"auto","agents":["mark"],"minutes":480},
+    "root-ssh":{"grant":"never"}}}
+  ```
+
+  `auto` is only for the agents it names. Anyone else asks. Anything unlisted
+  takes `default` (`ask` unless set).
+- **Asking twice is one request.** The same house and secret gets the same
+  card while it's pending or granted.
+- **No value is in a request, the page, the record or a log.** `requests.json`
+  and `audit.jsonl` (every request, answer, read and refused read) hold names,
+  houses and reasons. `get` reads the value from the store for the granted
+  house, through loom's piece API.
+- **The owner can revoke** a live grant from the page's Requests.
+
 ## In loom's bundle
 
 `loom export` and `loom restore` (loom's `docs/specs/household.md`, "Export

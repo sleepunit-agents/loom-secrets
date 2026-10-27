@@ -26,6 +26,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError } from './requests.mjs';
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const STORE = 'store.sops.json';
@@ -45,6 +46,11 @@ const USAGE = `Usage: loom secrets <command> [args]
   ui act --json                 loom's page: add / replace / remove, from
                                 {action, path, fields} on stdin. Write-only:
                                 there is no action that reads a value back
+  api --json                    loom's piece API, {caller, path:'run', body:{argv}} on stdin, for
+                                a house's own token only (agent:<a>@<house>):
+                                  request <name> --why TEXT [--minutes N]
+                                  get <name>    (with a live grant for this house)
+                                  status        (this house's requests)
   bundle export                 loom's bundle: the store, age-encrypted to
                                 $LOOM_EXPORT_RECIPIENTS (comma-separated), on stdout
   bundle import [--force]       loom's restore: a part from export on stdin,
@@ -221,8 +227,45 @@ function uiManifest(c) {
       tone: keyed ? 'ok' : 'bad',
       page: '',
     },
-    asks: [],
+    // A house asking for a secret is the owner's call: a card with Allow and Deny (README, "Requests").
+    asks: pendingAsks(c),
   };
+}
+
+function pendingAsks(c) {
+  return allRequests(c).filter((r) => r.state === 'pending').slice(0, 10).map((r) => ({
+    text: `${r.agent} asks for ${r.secret}`,
+    meta: `house ${r.house}, for ${r.minutes} min: \u201c${r.why}\u201d`,
+    tone: 'warn', at: r.at, agent: r.agent, page: '',
+    actions: [
+      { action: 'grant', label: `Allow ${r.minutes} min`, tone: 'primary', fields: { id: r.id } },
+      { action: 'deny', label: 'Deny', tone: 'danger', fields: { id: r.id } },
+    ],
+  }));
+}
+
+/** The page's Requests: what's waiting, what's live (each revocable), and what was decided. */
+function requestSections(c) {
+  const rs = allRequests(c);
+  if (!rs.length) return [];
+  const item = (r) => ({
+    text: `${r.agent} · ${r.secret}`,
+    meta: `${r.house} · ${r.state}${r.expires && r.state === 'granted' ? ` until ${r.expires.slice(11, 16)} UTC` : ''} · \u201c${r.why}\u201d`,
+    tone: r.state === 'pending' ? 'warn' : r.state === 'granted' ? 'ok' : undefined,
+    ...(r.state === 'granted' ? { act: { action: 'revoke', label: 'Revoke', tone: 'danger', fields: { id: r.id }, confirm: `${r.house} won't be able to read ${r.secret} again.` } } : {}),
+  });
+  return [{ id: 'requests', title: 'Requests', blocks: [{ type: 'list', items: rs.slice(0, 20).map(item) }] }];
+}
+
+/** Who gets what without asking (policy.json): auto and never, and what everything else does. */
+function policySection(c) {
+  const p = readPolicy(c);
+  const rules = Object.entries(p.secrets).filter(([, r]) => r && (r.grant === 'auto' || r.grant === 'never'));
+  const items = [
+    { label: 'Anything else', value: p.default === 'ask' ? 'asks you' : p.default === 'auto' ? 'granted to any house' : 'refused' },
+    ...rules.map(([name, r]) => ({ label: name, value: r.grant === 'never' ? 'never' : `auto for ${(r.agents || []).join(', ') || 'nobody'}, ${r.minutes || 60} min` })),
+  ];
+  return { id: 'policy', side: true, title: 'Who gets what', blocks: [{ type: 'kv', items }, { type: 'text', tone: 'muted', text: `policy.json in ${c.dir}` }] };
 }
 
 function uiPage(c, req) {
@@ -242,6 +285,8 @@ function uiPage(c, req) {
   const sections = [];
   if (!keyed) sections.push({ id: 'key', blocks: [{ type: 'callout', tone: 'bad', title: 'No age key',
     text: `There is no age key at ${c.key}, so nothing can be stored. Run: loom secrets init` }] });
+  sections.push(...requestSections(c));
+  sections.push(policySection(c));
   sections.push({ id: 'store', blocks: shown.length
     ? [{ type: 'list', items: shown.map((name) => ({ text: name, page: `secret?name=${encodeURIComponent(name)}` })) }]
     : [{ type: 'text', tone: 'muted', text: 'Nothing stored yet.' }] });
@@ -266,7 +311,7 @@ function uiPage(c, req) {
   }
   return {
     title: 'Secrets',
-    intro: `${all.length} stored, ${keyed ? 'key on this host' : 'no key'}. Write-only: bodies get them when they start, and there is no way to read one back.`,
+    intro: `${all.length} stored, ${keyed ? 'key on this host' : 'no key'}. Write-only: bodies get them when they start, or ask for one (you allow or deny it here), and there is no way to read one back on this page.`,
     sections,
   };
 }
@@ -293,10 +338,20 @@ const MESSAGES = {
   remove: (n) => `${n} is removed from the store.`,
 };
 
+const ANSWERS = { grant: 'Allowed', deny: 'Denied', revoke: 'Revoked' };
+
 function uiAct(c, env, req) {
   const no = (message) => ({ ok: false, message, page: '' });
   if (!req) return no('That request could not be read.');
   const action = req.action;
+  if (Object.hasOwn(ANSWERS, action)) {
+    const id = req.fields?.id;
+    if (typeof id !== 'string' || !/^q-[0-9a-f]{8}$/.test(id)) return no('That is not a request.');
+    try {
+      const r = answer(c, id, action);
+      return { ok: true, message: `${ANSWERS[action]}: ${r.agent}'s ${r.secret} for ${r.house}${action === 'grant' ? `, for ${r.minutes} min` : ''}.`, page: '' };
+    } catch (err) { return no(err.message); }
+  }
   if (!Object.hasOwn(MESSAGES, action)) return no('The secrets piece has no such action.');
   const fields = req.fields && typeof req.fields === 'object' ? req.fields : {};
   const name = fields.name;
@@ -491,6 +546,17 @@ export async function main(argv, io) {
       throw new Fail(`unknown bundle command ${sub ?? '(none)'}; it's bundle export or bundle import\n${USAGE}`, 2);
     }
 
+    case 'api': {
+      // loom's piece API (docs/extensions.md, "The API"): {caller, path:'run', body:{argv}}.
+      //   request NAME --why TEXT [--minutes N]   ask for a secret (a house's own token only)
+      //   get NAME                                 read it, with a live grant for this house
+      //   status                                   this house's requests
+      allow(['--json']);
+      const req = await readRequest(io);
+      io.stdout(JSON.stringify(await apiAnswer(c, io.env, req)) + '\n');
+      return 0;
+    }
+
     case 'list': {
       allow(['--json']);
       const n = names(c);
@@ -541,6 +607,38 @@ export async function main(argv, io) {
     default:
       throw new Fail(`unknown command ${cmd}\n${USAGE}`, 2);
   }
+}
+
+async function apiAnswer(c, env, req) {
+  const refuse = (status, error) => ({ status, body: { error } });
+  if (!req || req.path !== 'run') return refuse(404, 'the one call is run');
+  const argv = req.body?.argv;
+  if (!Array.isArray(argv) || !argv.length || argv.length > 8 || !argv.every((a) => typeof a === 'string' && a.length <= 600)) {
+    return refuse(400, 'argv is: request NAME --why TEXT [--minutes N] | get NAME | status');
+  }
+  const flag = (n) => { const i = argv.indexOf(n); return i > 0 && i + 1 < argv.length ? argv[i + 1] : undefined; };
+  const ok = (stdout) => ({ status: 200, body: { exit: 0, stdout, stderr: '' } });
+  const fail = (e) => (e instanceof RequestError && e.status !== 403 && e.status !== 404
+    ? { status: 200, body: { exit: 1, stdout: '', stderr: `secrets: ${e.message}\n` } }
+    : refuse(e.status ?? 500, e.message));
+  try {
+    if (argv[0] === 'request' && argv[1] && NAME.test(argv[1])) {
+      const m = flag('--minutes');
+      const r = request(c, req.caller, { secret: argv[1], why: flag('--why'), minutes: m === undefined ? undefined : Number(m) }, names(c));
+      const say = r.state === 'granted' ? `granted: ${r.secret} for this house until ${r.expires} (\`secret get ${r.secret}\`)`
+        : r.state === 'pending' ? `asked the owner (request ${r.id}); \`secret get ${r.secret}\` works once they allow it`
+          : `denied: the policy doesn't give ${r.secret} out`;
+      return { status: 200, body: { exit: r.state === 'denied' ? 1 : 0, stdout: `${say}\n`, stderr: '' } };
+    }
+    if (argv[0] === 'get' && argv[1] && NAME.test(argv[1]) && argv.length === 2) {
+      mayRead(c, req.caller, argv[1]);
+      const data = decrypt(c, env);
+      if (!Object.hasOwn(data, argv[1])) throw new RequestError(`there is no secret named ${argv[1]}`, 404);
+      return ok(data[argv[1]]);
+    }
+    if (argv[0] === 'status' && argv.length === 1) return ok(JSON.stringify(mine(c, req.caller)) + '\n');
+    return refuse(400, 'argv is: request NAME --why TEXT [--minutes N] | get NAME | status');
+  } catch (e) { return fail(e); }
 }
 
 export function realIO() {
