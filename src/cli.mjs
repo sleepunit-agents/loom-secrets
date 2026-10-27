@@ -286,7 +286,6 @@ function uiPage(c, req) {
   if (!keyed) sections.push({ id: 'key', blocks: [{ type: 'callout', tone: 'bad', title: 'No age key',
     text: `There is no age key at ${c.key}, so nothing can be stored. Run: loom secrets init` }] });
   sections.push(...requestSections(c));
-  sections.push(policySection(c));
   sections.push({ id: 'store', blocks: shown.length
     ? [{ type: 'list', items: shown.map((name) => ({ text: name, page: `secret?name=${encodeURIComponent(name)}` })) }]
     : [{ type: 'text', tone: 'muted', text: 'Nothing stored yet.' }] });
@@ -309,6 +308,7 @@ function uiPage(c, req) {
     sections.push({ id: 'parts', side: true, title: `Showing ${shown.length} of ${all.length}`,
       blocks: [{ type: 'filters', param: 'part', options }] });
   }
+  sections.push(policySection(c));
   return {
     title: 'Secrets',
     intro: `${all.length} stored, ${keyed ? 'key on this host' : 'no key'}. Write-only: bodies get them when they start, or ask for one (you allow or deny it here), and there is no way to read one back on this page.`,

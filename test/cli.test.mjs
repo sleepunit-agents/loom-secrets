@@ -177,7 +177,7 @@ test('ui page "": an intro, what\'s stored first, then the Add form (text name, 
   const p = page();
   assert.equal(p.title, 'Secrets');
   assert.match(p.intro, /no way to read one back/);
-  assert.deepEqual(p.sections.map((s) => s.id), ['store', 'add']);
+  assert.deepEqual(p.sections.map((s) => s.id), ['store', 'add', 'policy']);
   assert.equal(p.sections[1].title, 'Add a secret');
   const form = blocksOf(p, 'add').find((b) => b.type === 'form');
   assert.equal(form.action, 'add');
