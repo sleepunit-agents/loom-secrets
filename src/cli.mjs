@@ -26,7 +26,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError } from './requests.mjs';
+import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError, standing, stopAlways } from './requests.mjs';
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const STORE = 'store.sops.json';
@@ -235,7 +235,7 @@ function uiManifest(c) {
 }
 
 const OUTCOME = {
-  granted: (r) => `Allowed for ${r.minutes} min${r.by === 'owner' ? '' : ' (by the policy)'}.`,
+  granted: (r) => r.always ? `Allowed, and from now on without asking.` : `Allowed for ${r.minutes} min${r.by === 'owner' ? '' : ' (by the policy)'}.`,
   expired: (r) => `Allowed for ${r.minutes} min${r.by === 'owner' ? '' : ' (by the policy)'}; it ran out.`,
   denied: (r) => `Denied${r.by === 'owner' ? '' : ' (by the policy)'}.`,
   revoked: () => 'Allowed, then revoked.',
@@ -255,6 +255,8 @@ function pendingAsks(c) {
     tone: 'warn', at: r.at, agent: r.agent, page: '', kind: 'permission',
     actions: [
       { action: 'grant', label: `Allow ${r.minutes} min`, tone: 'primary', fields: { id: r.id } },
+      { action: 'always', label: `Always allow ${r.agent}`, fields: { id: r.id },
+        confirm: `Every house of ${r.agent} gets ${r.secret} without asking, until you stop it on the secret's page.` },
       { action: 'deny', label: 'Deny', tone: 'danger', fields: { id: r.id } },
     ],
   }));
@@ -332,13 +334,24 @@ function uiPage(c, req) {
   };
 }
 
+/** Who gets this secret without asking (Always allow on a request card), each with Stop. */
+function standingSection(c, name) {
+  const agents = standing(c, name);
+  if (!agents.length) return [];
+  return [{ id: 'standing', title: 'Given without asking', blocks: [{ type: 'list', items: agents.map((agent) => ({
+    text: agent, meta: `every house of ${agent} gets it when it asks`,
+    act: { action: 'stop-always', label: 'Stop', tone: 'danger', fields: { name, agent },
+      confirm: `${agent}'s houses will ask you for ${name} again.` },
+  })) }] }];
+}
+
 /** One stored name: a Replace form and a Remove button. Never a value. */
 function secretPage(c, name) {
   if (!NAME.test(name) || !names(c).includes(name)) return NOT_FOUND;
   return {
     title: name,
     intro: 'Write-only: its value is never shown, here or anywhere on this page.',
-    sections: [{ id: 'secret', blocks: [
+    sections: [...standingSection(c, name), { id: 'secret', blocks: [
       { type: 'form', title: 'Replace', action: 'replace', submit: 'Replace', hidden: { name },
         note: 'The old value is overwritten. Bodies pick up the new one the next time they start.',
         fields: [{ name: 'value', label: 'New value', kind: 'secret', required: true }] },
@@ -354,7 +367,8 @@ const MESSAGES = {
   remove: (n) => `${n} is removed from the store.`,
 };
 
-const ANSWERS = { grant: 'Allowed', deny: 'Denied', revoke: 'Revoked' };
+const ANSWERS = { grant: 'Allowed', always: 'Always allowed', deny: 'Denied', revoke: 'Revoked' };
+const AGENT = /^[a-z][a-z0-9-]{0,39}$/;
 
 function uiAct(c, env, req) {
   const no = (message) => ({ ok: false, message, page: '' });
@@ -365,7 +379,17 @@ function uiAct(c, env, req) {
     if (typeof id !== 'string' || !/^q-[0-9a-f]{8}$/.test(id)) return no('That is not a request.');
     try {
       const r = answer(c, id, action);
-      return { ok: true, message: `${ANSWERS[action]}: ${r.agent}'s ${r.secret} for ${r.house}${action === 'grant' ? `, for ${r.minutes} min` : ''}.`, page: '' };
+      return { ok: true, message: action === 'always'
+        ? `Allowed: ${r.agent}'s ${r.secret} for ${r.house}, and ${r.agent}'s houses get it without asking from now on.`
+        : `${ANSWERS[action]}: ${r.agent}'s ${r.secret} for ${r.house}${action === 'grant' ? `, for ${r.minutes} min` : ''}.`, page: '' };
+    } catch (err) { return no(err.message); }
+  }
+  if (action === 'stop-always') {
+    const { name, agent } = req.fields && typeof req.fields === 'object' ? req.fields : {};
+    if (typeof name !== 'string' || !NAME.test(name) || typeof agent !== 'string' || !AGENT.test(agent)) return no('That is not a secret and an agent.');
+    try {
+      stopAlways(c, name, agent);
+      return { ok: true, message: `${agent}'s houses will ask for ${name} again.`, page: '' };
     } catch (err) { return no(err.message); }
   }
   if (!Object.hasOwn(MESSAGES, action)) return no('The secrets piece has no such action.');

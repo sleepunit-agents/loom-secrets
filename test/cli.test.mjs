@@ -545,7 +545,7 @@ test('requests: ask by default, the owner allows on the page, and only that hous
   const ask = m.asks[0];
   assert.match(ask.text, /art asks for onterris-gh/);
   assert.match(ask.meta, /h-7.*push the fix for onterris\/pond#212 b now \/b/);
-  assert.deepEqual(ask.actions.map((a) => a.action), ['grant', 'deny']);
+  assert.deepEqual(ask.actions.map((a) => a.action), ['grant', 'always', 'deny']);
   // Waiting: no value yet.
   assert.equal(api(house('h-7'), ['get', 'onterris-gh']).status, 403);
   const act = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'grant', fields: ask.actions[0].fields }) }).stdout);
@@ -597,4 +597,56 @@ test('requests: the policy grants (auto, for the agents it names), refuses (neve
   assert.equal(no.body.exit, 1);
   assert.match(no.body.stdout, /denied/);
   assert.equal(api(house('h-20', 'mark'), ['get', 'root-ssh']).status, 403);
+});
+
+test('requests: Always allow grants this one and every later house of that agent, until the owner stops it', { skip }, () => {
+  cli(['add', 'onterris-always'], { input: 'ONTERRIS' });
+  writeFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), JSON.stringify({ v: 1, default: 'ask', secrets: {
+    'onterris-always': { grant: 'ask', minutes: 60 }, 'root-ssh': { grant: 'never' } } }));
+  api(house('h-30'), ['request', 'onterris-always', '--why', 'pond work']);
+  const ask = JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.text.includes('onterris-always'));
+  assert.deepEqual(ask.actions.map((a) => a.action), ['grant', 'always', 'deny']);
+  const always = ask.actions.find((a) => a.action === 'always');
+  assert.match(always.label, /Always allow art/);
+  assert.ok(always.confirm, 'a standing grant asks to be sure');
+  const act = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'always', fields: always.fields }) }).stdout);
+  assert.equal(act.ok, true, act.message);
+  assert.match(act.message, /without asking/);
+  // This house has it, and for a house's working day.
+  assert.equal(api(house('h-30'), ['get', 'onterris-always']).body.stdout, 'ONTERRIS');
+  assert.equal(JSON.parse(api(house('h-30'), ['status']).body.stdout)[0].minutes, 480);
+  // The next house of art gets it without a card; mark still asks; never stays never.
+  assert.match(api(house('h-31'), ['request', 'onterris-always', '--why', 'more pond']).body.stdout, /granted/);
+  assert.match(api(house('h-32', 'mark'), ['request', 'onterris-always', '--why', 'x']).body.stdout, /asked the owner/);
+  const pol = JSON.parse(readFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), 'utf-8'));
+  assert.deepEqual(pol.secrets['onterris-always'], { grant: 'auto', agents: ['art'], minutes: 480 });
+  assert.deepEqual(pol.secrets['root-ssh'], { grant: 'never' });
+  const hist = JSON.parse(cli(['ui', '--json']).stdout).answered.find((a) => a.text.includes('pond work'));
+  assert.match(hist.outcome, /from now on without asking/);
+  // The secret's page says who has it without asking, and the owner can stop it there.
+  const page = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: 'secret', query: { name: 'onterris-always' } }) }).stdout);
+  const standing = page.sections.find((s) => s.id === 'standing');
+  const row = standing.blocks[0].items.find((i) => i.text === 'art');
+  assert.equal(row.act.action, 'stop-always');
+  const stop = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'stop-always', fields: row.act.fields }) }).stdout);
+  assert.equal(stop.ok, true, stop.message);
+  assert.match(api(house('h-33'), ['request', 'onterris-always', '--why', 'again']).body.stdout, /asked the owner/);
+  assert.deepEqual(JSON.parse(readFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), 'utf-8')).secrets['onterris-always'],
+    { grant: 'ask', minutes: 480 });
+  // A live grant isn't pulled by stopping the standing one (Revoke does that), and a bad agent or name is refused.
+  assert.equal(api(house('h-31'), ['get', 'onterris-always']).body.stdout, 'ONTERRIS');
+  for (const fields of [{ name: 'onterris-always', agent: 'Art!' }, { name: 'nope', agent: 'art' }]) {
+    assert.equal(JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'stop-always', fields }) }).stdout).ok, false);
+  }
+  // A secret moved to never while its card waited can't be always-allowed from it.
+  api(house('h-34'), ['request', 'onterris-always', '--why', 'late']);
+  const late = JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.meta.includes('late')).actions.find((a) => a.action === 'always');
+  const pol2 = JSON.parse(readFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), 'utf-8'));
+  pol2.secrets['onterris-always'] = { grant: 'never' };
+  writeFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), JSON.stringify(pol2));
+  const refused = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'always', fields: late.fields }) }).stdout);
+  assert.equal(refused.ok, false);
+  assert.deepEqual(JSON.parse(readFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), 'utf-8')).secrets['onterris-always'], { grant: 'never' });
+  const audit = readFileSync(join(env.LOOM_SECRETS_DIR, 'audit.jsonl'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l).event);
+  assert.ok(audit.includes('always') && audit.includes('stop-always'), audit.join(' '));
 });

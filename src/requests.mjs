@@ -96,7 +96,7 @@ function audit(c, event) {
 /** A request is the whole caller's: its agent, its house, and its service if it has one. */
 const sameCaller = (r, h) => r.house === h.house && r.agent === h.agent && (r.service ?? null) === (h.service ?? null);
 const live = (r, now = Date.now()) => r.state === 'granted' && Date.parse(r.expires) > now;
-const view = (r) => ({ id: r.id, secret: r.secret, agent: r.agent, house: r.house, state: live(r) ? 'granted' : r.state === 'granted' ? 'expired' : r.state, why: r.why, minutes: r.minutes, at: r.at, ...(r.expires ? { expires: r.expires } : {}), ...(r.decided ? { decided: r.decided } : {}), ...(r.by ? { by: r.by } : {}) });
+const view = (r) => ({ ...(r.always ? { always: true } : {}), id: r.id, secret: r.secret, agent: r.agent, house: r.house, state: live(r) ? 'granted' : r.state === 'granted' ? 'expired' : r.state, why: r.why, minutes: r.minutes, at: r.at, ...(r.expires ? { expires: r.expires } : {}), ...(r.decided ? { decided: r.decided } : {}), ...(r.by ? { by: r.by } : {}) });
 
 /** The house a caller is: only a house's own token (agent, with its house) asks or reads. */
 function houseOf(caller) {
@@ -157,7 +157,48 @@ export function all(c) {
   return Object.values(load(c).requests).sort((a, b) => (b.at > a.at ? 1 : -1)).map(view);
 }
 
-/** The owner answers a request (the page): grant, deny, or revoke a live grant. */
+function writePolicy(c, edit) {
+  const p = paths(c).policy;
+  let d = {};
+  try { d = JSON.parse(readFileSync(p, 'utf-8')); } catch { d = {}; }
+  if (!d || typeof d !== 'object' || Array.isArray(d)) d = {};
+  d.v ??= 1;
+  if (!d.secrets || typeof d.secrets !== 'object' || Array.isArray(d.secrets)) d.secrets = {};
+  edit(d.secrets);
+  const tmp = `${p}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(d, null, 2) + '\n', { mode: 0o600 });
+  renameSync(tmp, p);
+}
+
+/** Give a secret to an agent's houses without asking (on), or have them ask again (off). Called under the lock. */
+function setAuto(c, secret, agent, on) {
+  writePolicy(c, (secrets) => {
+    const rule = secrets[secret] && typeof secrets[secret] === 'object' ? secrets[secret] : {};
+    if (rule.grant === 'never') throw new RequestError(`the policy never gives ${secret} out`, 409);
+    const agents = new Set(rule.grant === 'auto' && Array.isArray(rule.agents) ? rule.agents : []);
+    if (on) agents.add(agent); else agents.delete(agent);
+    const next = { ...rule, grant: agents.size ? 'auto' : 'ask', minutes: MAX_MINUTES };
+    if (agents.size) next.agents = [...agents].sort(); else delete next.agents;
+    secrets[secret] = next;
+  });
+}
+
+/** Who gets a secret without asking: the agents its auto names. */
+export function standing(c, secret) {
+  const rule = readPolicy(c).secrets[secret];
+  return rule?.grant === 'auto' && Array.isArray(rule.agents) ? rule.agents : [];
+}
+
+/** The owner stops an agent getting a secret without asking. Its live grants stay (Revoke ends those). */
+export function stopAlways(c, secret, agent) {
+  return locked(c, () => {
+    if (!standing(c, secret).includes(agent)) throw new RequestError(`${agent} doesn't get ${secret} without asking`, 409);
+    setAuto(c, secret, agent, false);
+    audit(c, { event: 'stop-always', secret, agent, by: 'owner' });
+  });
+}
+
+/** The owner answers a request (the page): grant, always (grant, and auto from now on), deny, or revoke a live grant. */
 export function answer(c, id, action) {
   return locked(c, () => {
     const d = load(c);
@@ -170,6 +211,18 @@ export function answer(c, id, action) {
       r.by = 'owner';
       r.decided = now.toISOString();
       if (action === 'grant') r.expires = new Date(now.getTime() + r.minutes * 60_000).toISOString();
+    } else if (action === 'always') {
+      // Allow this one, and from now on this agent's houses get it without asking:
+      // the policy's auto for it, for a house's working day (a grant still ends with its house).
+      if (r.state !== 'pending') throw new RequestError(`that request is already ${view(r).state}`, 409);
+      if (decide(readPolicy(c), r.agent, r.secret).level === 'never') throw new RequestError(`the policy never gives ${r.secret} out`, 409);
+      setAuto(c, r.secret, r.agent, true);
+      r.state = 'granted';
+      r.by = 'owner';
+      r.always = true;
+      r.minutes = MAX_MINUTES;
+      r.decided = now.toISOString();
+      r.expires = new Date(now.getTime() + r.minutes * 60_000).toISOString();
     } else if (action === 'revoke') {
       if (!live(r)) throw new RequestError('that grant isn\'t live', 409);
       r.state = 'revoked';
