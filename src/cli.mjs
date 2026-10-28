@@ -229,14 +229,30 @@ function uiManifest(c) {
     },
     // A house asking for a secret is the owner's call: a card with Allow and Deny (README, "Requests").
     asks: pendingAsks(c),
+    // loom's Inbox, Answered: what was decided, by the owner or the policy.
+    answered: answeredRequests(c),
   };
+}
+
+const OUTCOME = {
+  granted: (r) => `Allowed for ${r.minutes} min${r.by === 'owner' ? '' : ' (by the policy)'}.`,
+  expired: (r) => `Allowed for ${r.minutes} min${r.by === 'owner' ? '' : ' (by the policy)'}; it ran out.`,
+  denied: (r) => `Denied${r.by === 'owner' ? '' : ' (by the policy)'}.`,
+  revoked: () => 'Allowed, then revoked.',
+};
+
+function answeredRequests(c) {
+  return allRequests(c).filter((r) => OUTCOME[r.state]).slice(0, 20).map((r) => ({
+    text: `${r.agent} asked for ${r.secret}: \u201c${r.why}\u201d`.slice(0, 300), outcome: OUTCOME[r.state](r),
+    at: r.decided ?? r.at, kind: 'permission', agent: r.agent, page: '',
+  }));
 }
 
 function pendingAsks(c) {
   return allRequests(c).filter((r) => r.state === 'pending').slice(0, 10).map((r) => ({
     text: `${r.agent} asks for ${r.secret}`,
     meta: `house ${r.house}, for ${r.minutes} min: \u201c${r.why}\u201d`,
-    tone: 'warn', at: r.at, agent: r.agent, page: '',
+    tone: 'warn', at: r.at, agent: r.agent, page: '', kind: 'permission',
     actions: [
       { action: 'grant', label: `Allow ${r.minutes} min`, tone: 'primary', fields: { id: r.id } },
       { action: 'deny', label: 'Deny', tone: 'danger', fields: { id: r.id } },

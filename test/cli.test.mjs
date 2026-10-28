@@ -551,6 +551,12 @@ test('requests: ask by default, the owner allows on the page, and only that hous
   const act = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'grant', fields: ask.actions[0].fields }) }).stdout);
   assert.equal(act.ok, true, act.message);
   assert.equal(JSON.parse(cli(['ui', '--json']).stdout).asks.length, 0);
+  // loom's Inbox: the card was a permission, and what was answered is its history.
+  assert.equal(ask.kind, 'permission');
+  const after = JSON.parse(cli(['ui', '--json']).stdout).answered;
+  assert.equal(after.length, 1);
+  assert.match(after[0].text, /^art asked for onterris-gh/);
+  assert.equal(after[0].outcome, `Allowed for ${ask.actions[0].label.match(/\d+/)[0]} min.`);
   const got = api(house('h-7'), ['get', 'onterris-gh']);
   assert.equal(got.body.stdout, 'ghp_ONTERRIS_VALUE');
   // Another house of the same agent has nothing.

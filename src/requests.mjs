@@ -96,7 +96,7 @@ function audit(c, event) {
 /** A request is the whole caller's: its agent, its house, and its service if it has one. */
 const sameCaller = (r, h) => r.house === h.house && r.agent === h.agent && (r.service ?? null) === (h.service ?? null);
 const live = (r, now = Date.now()) => r.state === 'granted' && Date.parse(r.expires) > now;
-const view = (r) => ({ id: r.id, secret: r.secret, agent: r.agent, house: r.house, state: live(r) ? 'granted' : r.state === 'granted' ? 'expired' : r.state, why: r.why, minutes: r.minutes, at: r.at, ...(r.expires ? { expires: r.expires } : {}) });
+const view = (r) => ({ id: r.id, secret: r.secret, agent: r.agent, house: r.house, state: live(r) ? 'granted' : r.state === 'granted' ? 'expired' : r.state, why: r.why, minutes: r.minutes, at: r.at, ...(r.expires ? { expires: r.expires } : {}), ...(r.decided ? { decided: r.decided } : {}), ...(r.by ? { by: r.by } : {}) });
 
 /** The house a caller is: only a house's own token (agent, with its house) asks or reads. */
 function houseOf(caller) {
