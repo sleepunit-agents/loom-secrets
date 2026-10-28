@@ -177,7 +177,8 @@ function setAuto(c, secret, agent, on) {
     if (rule.grant === 'never') throw new RequestError(`the policy never gives ${secret} out`, 409);
     const agents = new Set(rule.grant === 'auto' && Array.isArray(rule.agents) ? rule.agents : []);
     if (on) agents.add(agent); else agents.delete(agent);
-    const next = { ...rule, grant: agents.size ? 'auto' : 'ask', minutes: MAX_MINUTES };
+    // Always gives a house's working day; Stop leaves the length as it was.
+    const next = { ...rule, grant: agents.size ? 'auto' : 'ask', ...(on ? { minutes: MAX_MINUTES } : {}) };
     if (agents.size) next.agents = [...agents].sort(); else delete next.agents;
     secrets[secret] = next;
   });
@@ -187,6 +188,16 @@ function setAuto(c, secret, agent, on) {
 export function standing(c, secret) {
   const rule = readPolicy(c).secrets[secret];
   return rule?.grant === 'auto' && Array.isArray(rule.agents) ? rule.agents : [];
+}
+
+/** A secret removed from the store takes its standing grants with it, so a name added again starts by asking. */
+export function forgetStanding(c, secret) {
+  return locked(c, () => {
+    const agents = standing(c, secret);
+    if (!agents.length) return;
+    writePolicy(c, (secrets) => { delete secrets[secret]; });
+    audit(c, { event: 'stop-always', secret, agents, by: 'owner', why: 'removed' });
+  });
 }
 
 /** The owner stops an agent getting a secret without asking. Its live grants stay (Revoke ends those). */

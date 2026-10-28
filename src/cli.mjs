@@ -26,7 +26,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError, standing, stopAlways } from './requests.mjs';
+import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError, standing, stopAlways, forgetStanding } from './requests.mjs';
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const STORE = 'store.sops.json';
@@ -161,6 +161,7 @@ function remove(c, env, name) {
     delete data[name];
     encrypt(c, env, data);
   });
+  forgetStanding(c, name);
 }
 
 async function readValue(io) {
@@ -256,7 +257,7 @@ function pendingAsks(c) {
     actions: [
       { action: 'grant', label: `Allow ${r.minutes} min`, tone: 'primary', fields: { id: r.id } },
       { action: 'always', label: `Always allow ${r.agent}`, fields: { id: r.id },
-        confirm: `Every house of ${r.agent} gets ${r.secret} without asking, until you stop it on the secret's page.` },
+        confirm: `Every house of ${r.agent} gets ${r.secret} without asking, 8 h at a time, until you stop it on the secret's page.` },
       { action: 'deny', label: 'Deny', tone: 'danger', fields: { id: r.id } },
     ],
   }));
@@ -368,7 +369,6 @@ const MESSAGES = {
 };
 
 const ANSWERS = { grant: 'Allowed', always: 'Always allowed', deny: 'Denied', revoke: 'Revoked' };
-const AGENT = /^[a-z][a-z0-9-]{0,39}$/;
 
 function uiAct(c, env, req) {
   const no = (message) => ({ ok: false, message, page: '' });
@@ -386,7 +386,8 @@ function uiAct(c, env, req) {
   }
   if (action === 'stop-always') {
     const { name, agent } = req.fields && typeof req.fields === 'object' ? req.fields : {};
-    if (typeof name !== 'string' || !NAME.test(name) || typeof agent !== 'string' || !AGENT.test(agent)) return no('That is not a secret and an agent.');
+    // The agent is checked by exact membership in the policy's list (stopAlways), not by a pattern of its own.
+    if (typeof name !== 'string' || !NAME.test(name) || typeof agent !== 'string' || agent.length > 64) return no('That is not a secret and an agent.');
     try {
       stopAlways(c, name, agent);
       return { ok: true, message: `${agent}'s houses will ask for ${name} again.`, page: '' };

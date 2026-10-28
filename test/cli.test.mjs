@@ -632,10 +632,10 @@ test('requests: Always allow grants this one and every later house of that agent
   assert.equal(stop.ok, true, stop.message);
   assert.match(api(house('h-33'), ['request', 'onterris-always', '--why', 'again']).body.stdout, /asked the owner/);
   assert.deepEqual(JSON.parse(readFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), 'utf-8')).secrets['onterris-always'],
-    { grant: 'ask', minutes: 480 });
+    { grant: 'ask', minutes: 480 }, 'Stop leaves the length as Always set it');
   // A live grant isn't pulled by stopping the standing one (Revoke does that), and a bad agent or name is refused.
   assert.equal(api(house('h-31'), ['get', 'onterris-always']).body.stdout, 'ONTERRIS');
-  for (const fields of [{ name: 'onterris-always', agent: 'Art!' }, { name: 'nope', agent: 'art' }]) {
+  for (const fields of [{ name: 'onterris-always', agent: 'Art!' }, { name: 'nope', agent: 'art' }, { name: 'onterris-always', agent: 'art' }]) {
     assert.equal(JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'stop-always', fields }) }).stdout).ok, false);
   }
   // A secret moved to never while its card waited can't be always-allowed from it.
@@ -647,6 +647,15 @@ test('requests: Always allow grants this one and every later house of that agent
   const refused = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'always', fields: late.fields }) }).stdout);
   assert.equal(refused.ok, false);
   assert.deepEqual(JSON.parse(readFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), 'utf-8')).secrets['onterris-always'], { grant: 'never' });
+  // Removing a secret takes its standing grants with it: the name added again starts by asking.
+  cli(['add', 'gone-later'], { input: 'G' });
+  api(house('h-40'), ['request', 'gone-later', '--why', 'x']);
+  const g = JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.text.includes('gone-later')).actions.find((a) => a.action === 'always');
+  cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'always', fields: g.fields }) });
+  assert.match(api(house('h-41'), ['request', 'gone-later', '--why', 'y']).body.stdout, /granted/);
+  assert.equal(cli(['rm', 'gone-later']).status, 0);
+  cli(['add', 'gone-later'], { input: 'G2' });
+  assert.match(api(house('h-42'), ['request', 'gone-later', '--why', 'z']).body.stdout, /asked the owner/);
   const audit = readFileSync(join(env.LOOM_SECRETS_DIR, 'audit.jsonl'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l).event);
   assert.ok(audit.includes('always') && audit.includes('stop-always'), audit.join(' '));
 });
