@@ -237,10 +237,16 @@ function uiManifest(c) {
   };
 }
 
+/** Who decided, as the history says it: the member who answered, or the policy. */
+const by = (r) => (r.by === 'owner' ? (r.who ? ` by ${r.who}` : '') : ' (by the policy)');
+
+/** The member acting on loom's page (its caller, in a household), or none. */
+const whoOf = (req) => (req?.caller?.kind === 'owner' && typeof req.caller.who === 'string' && /^[a-z0-9]+(-[a-z0-9]+)*$/.test(req.caller.who) ? req.caller.who : undefined);
+
 const OUTCOME = {
-  granted: (r) => r.always ? `Allowed, and from now on without asking.` : `Allowed for ${r.minutes} min${r.by === 'owner' ? '' : ' (by the policy)'}.`,
-  expired: (r) => `Allowed for ${r.minutes} min${r.by === 'owner' ? '' : ' (by the policy)'}; it ran out.`,
-  denied: (r) => `Denied${r.by === 'owner' ? '' : ' (by the policy)'}.`,
+  granted: (r) => r.always ? `Allowed${by(r)}, and from now on without asking.` : `Allowed for ${r.minutes} min${by(r)}.`,
+  expired: (r) => `Allowed for ${r.minutes} min${by(r)}; it ran out.`,
+  denied: (r) => `Denied${by(r)}.`,
   revoked: () => 'Allowed, then revoked.',
 };
 
@@ -380,7 +386,7 @@ function uiAct(c, env, req) {
     const id = req.fields?.id;
     if (typeof id !== 'string' || !/^q-[0-9a-f]{8}$/.test(id)) return no('That is not a request.');
     try {
-      const r = answer(c, id, action);
+      const r = answer(c, id, action, whoOf(req));
       return { ok: true, message: action === 'always'
         ? `Allowed: ${r.agent}'s ${r.secret} for ${r.house}, and ${r.agent}'s houses get it without asking from now on.`
         : `${ANSWERS[action]}: ${r.agent}'s ${r.secret} for ${r.house}${action === 'grant' ? `, for ${r.minutes} min` : ''}.`, page: '' };
@@ -391,7 +397,7 @@ function uiAct(c, env, req) {
     // The agent is checked by exact membership in the policy's list (stopAlways), not by a pattern of its own.
     if (typeof name !== 'string' || !NAME.test(name) || typeof agent !== 'string' || agent.length > 64) return no('That is not a secret and an agent.');
     try {
-      stopAlways(c, name, agent);
+      stopAlways(c, name, agent, whoOf(req));
       return { ok: true, message: `${agent}'s houses will ask for ${name} again.`, page: '' };
     } catch (err) { return no(err.message); }
   }

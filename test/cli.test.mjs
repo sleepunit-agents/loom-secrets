@@ -699,3 +699,22 @@ test('requests: the owner\'s yes outlives the house that asked, once; the clock 
   assert.equal(cli(['state', 'q-00000000']).status, 3);
   assert.notEqual(api(house('h-51'), ['state', id]).body.exit, 0);
 });
+
+test('requests: an answer records who gave it (the caller loom names), and the history says so', { skip }, () => {
+  cli(['add', 'who-said'], { input: 'W' });
+  api(house('h-70'), ['request', 'who-said', '--why', 'x']);
+  const ask = JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.text.includes('who-said'));
+  const act = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'grant', fields: ask.actions[0].fields,
+    caller: { kind: 'owner', who: 'jonathan-barket', agents: '*' } }) }).stdout);
+  assert.equal(act.ok, true, act.message);
+  const hist = JSON.parse(cli(['ui', '--json']).stdout).answered.find((a) => a.text.includes('who-said'));
+  assert.match(hist.outcome, /^Allowed for \d+ min by jonathan-barket\.$/);
+  const audit = readFileSync(join(env.LOOM_SECRETS_DIR, 'audit.jsonl'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l)).filter((e) => e.secret === 'who-said' && e.event === 'grant');
+  assert.equal(audit[0].who, 'jonathan-barket');
+  // A caller that isn't an owner, or a who that isn't a slug, records nobody.
+  api(house('h-71', 'mark'), ['request', 'who-said', '--why', 'y']);  // another agent: the carry is art's
+  const ask2 = JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.text.includes('who-said'));
+  cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'deny', fields: ask2.actions.find((a) => a.action === 'deny').fields, caller: { kind: 'owner', who: 'Not A Slug' } }) });
+  const denied = JSON.parse(cli(['ui', '--json']).stdout).answered.find((a) => a.outcome.startsWith('Denied'));
+  assert.equal(denied.outcome, 'Denied.');
+});
