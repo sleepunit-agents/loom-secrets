@@ -146,6 +146,14 @@ house:  piece-call secrets get onterris-gh        (works once granted, for that 
   house). The secret's page lists who has it without asking, each with Stop,
   which puts them back to asking (live grants stay until Revoke or expiry).
   A secret whose policy is `never` can't be always-allowed.
+- **A yes outlives the house that asked.** By the time the owner answers, the
+  house that asked has usually ended (its body parked: `wake park --on q-…`,
+  t-1635). A plain Allow is claimed once by the same agent's next house (same
+  service, if a service asked), until it expires. A carried grant doesn't carry
+  again, an Always grant never carries (the policy covers the next house, and
+  Stop has to stop it), and a Deny never carries. On loom's machine,
+  `loom secrets state <id>` gives a request's state (never a value) for the
+  clock waiting on it.
 - **The owner can revoke** a live grant from the page's Requests.
 
 ## In loom's bundle
