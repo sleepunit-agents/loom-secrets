@@ -164,7 +164,8 @@ before(() => {
 test('ui --json is a v2 manifest: a Secrets tab, a count tile with the key state, no asks', { skip }, () => {
   const m = ui([]);
   assert.equal(m.v, 2);
-  assert.deepEqual(m.tab, { label: 'Secrets' });
+  assert.deepEqual(m.tab, { label: 'Secrets', kind: 'setting' });
+  assert.deepEqual(m.agentTab, { label: 'Secrets' }, "each agent's grants and requests are on its own tab");
   assert.deepEqual(m.tile, { label: 'Secrets', value: '0', detail: 'Key on this host', tone: 'ok', page: '' });
   assert.deepEqual(m.asks, []);
   assert.equal(m.sections, undefined);
@@ -562,9 +563,18 @@ test('requests: ask by default, the owner allows on the page, and only that hous
   // Another house of the same agent has nothing.
   assert.equal(api(house('h-8'), ['get', 'onterris-gh']).status, 403);
   // The page never carries the value; the owner can revoke.
-  const page = cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }) }).stdout;
+  const page = cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: 'art' } }).stdout;
   assert.ok(!page.includes('ghp_ONTERRIS_VALUE'));
   const live = JSON.parse(page).sections.find((s) => s.id === 'requests').blocks[0].items[0];
+  // The household's page doesn't list them: it links each agent's tab.
+  const home = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }) }).stdout);
+  assert.equal(home.sections.find((s) => s.id === 'requests'), undefined);
+  assert.deepEqual(home.sections.find((s) => s.id === 'agents').blocks[1].items.map((i) => i.page), ['agent:art']);
+  // From mark's tab, art's request is not mark's to revoke.
+  const other = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'revoke', fields: live.act.fields }), extraEnv: { LOOM_SCOPE: 'mark' } }).stdout);
+  assert.equal(other.ok, false);
+  assert.equal(JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: 'mark' } }).stdout)
+    .sections.find((s) => s.id === 'requests').blocks[0].type, 'text', "mark's tab has none of art's");
   assert.equal(live.act.action, 'revoke');
   cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'revoke', fields: live.act.fields }) });
   assert.equal(api(house('h-7'), ['get', 'onterris-gh']).status, 403);
@@ -633,6 +643,15 @@ test('requests: Always allow grants this one and every later house of that agent
   assert.match(api(house('h-33'), ['request', 'onterris-always', '--why', 'again']).body.stdout, /asked the owner/);
   assert.deepEqual(JSON.parse(readFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), 'utf-8')).secrets['onterris-always'],
     { grant: 'ask', minutes: 480 }, 'Stop leaves the length as Always set it');
+  // Art's Secrets tab says what it gets without asking, with the same Stop; mark's says nothing of art's.
+  const tab = (agent) => JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: agent } }).stdout);
+  cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'always', fields: (api(house('h-39'), ['request', 'onterris-always', '--why', 'x']),
+    JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.text.includes('onterris-always')).actions[1].fields) }) });
+  assert.deepEqual(tab('art').sections.find((s) => s.id === 'gets').blocks[0].items.map((i) => [i.text, i.act?.action]), [['onterris-always', 'stop-always']]);
+  assert.equal(tab('mark').sections.find((s) => s.id === 'gets').blocks[0].type, 'text');
+  assert.equal(JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'stop-always', fields: { name: 'onterris-always', agent: 'art' } }),
+    extraEnv: { LOOM_SCOPE: 'mark' } }).stdout).ok, false, "mark's tab can't stop art's");
+  cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'stop-always', fields: { name: 'onterris-always', agent: 'art' } }) });
   // A live grant isn't pulled by stopping the standing one (Revoke does that), and a bad agent or name is refused.
   assert.equal(api(house('h-31'), ['get', 'onterris-always']).body.stdout, 'ONTERRIS');
   for (const fields of [{ name: 'onterris-always', agent: 'Art!' }, { name: 'nope', agent: 'art' }, { name: 'onterris-always', agent: 'art' }]) {
@@ -686,7 +705,7 @@ test('requests: the owner\'s yes outlives the house that asked, once; the clock 
   cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'deny', fields: nc.actions.find((a) => a.action === 'deny').fields }) });
   assert.match(api(house('h-61'), ['request', 'no-carry', '--why', 'y']).body.stdout, /asked the owner/);
   // Revoking the original ends the carried one too.
-  const live1 = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }) }).stdout)
+  const live1 = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: 'art' } }).stdout)
     .sections.find((s) => s.id === 'requests').blocks[0].items.find((i) => i.text.includes('carry-me') && i.act && i.meta.startsWith('h-50'));
   if (live1) {
     cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'revoke', fields: live1.act.fields }) });
