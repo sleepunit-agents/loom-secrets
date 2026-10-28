@@ -157,7 +157,8 @@ export function mayRead(c, caller, secret) {
   const mine = Object.values(d.requests).filter((r) => sameCaller(r, h) && r.secret === secret);
   // The policy again, now: a secret moved to never stops being read at once, grant or not.
   const now = decide(readPolicy(c), h.agent, secret);
-  const ok = now.level === 'never' ? undefined : mine.find((r) => live(r));
+  // A grant carried to the agent's next house moved there: this house reads it no more.
+  const ok = now.level === 'never' ? undefined : mine.find((r) => live(r) && !r.claimedBy);
   if (ok) { audit(c, { event: 'read', id: ok.id, secret, agent: h.agent, house: h.house }); return ok; }
   const pending = mine.find((r) => r.state === 'pending');
   audit(c, { event: 'refused-read', secret, agent: h.agent, house: h.house });
@@ -257,6 +258,10 @@ export function answer(c, id, action) {
       if (!live(r)) throw new RequestError('that grant isn\'t live', 409);
       r.state = 'revoked';
       r.decided = now.toISOString();
+      // A carried grant is one grant in two records: revoking either ends both.
+      for (const other of [d.requests[r.claimedBy], d.requests[r.carriedFrom]]) {
+        if (other && live(other)) { other.state = 'revoked'; other.decided = r.decided; }
+      }
     } else throw new RequestError('no such answer');
     save(c, d);
     audit(c, { event: action, id, secret: r.secret, agent: r.agent, house: r.house, by: 'owner' });
