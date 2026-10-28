@@ -222,7 +222,9 @@ function uiManifest(c) {
   const keyed = existsSync(c.key);
   return {
     v: 2,
-    tab: { label: 'Secrets' },
+    // The store is the household's (under Setup); what each agent gets, and its requests, are on its own tab.
+    tab: { label: 'Secrets', kind: 'setting' },
+    agentTab: { label: 'Secrets' },
     tile: {
       label: 'Secrets',
       value: String(names(c).length),
@@ -272,8 +274,8 @@ function pendingAsks(c) {
 }
 
 /** The page's Requests: what's waiting, what's live (each revocable), and what was decided. */
-function requestSections(c) {
-  const rs = allRequests(c);
+function requestSections(c, only) {
+  const rs = allRequests(c).filter((r) => !only || r.agent === only);
   if (!rs.length) return [];
   const item = (r) => ({
     text: `${r.agent} · ${r.secret}`,
@@ -287,16 +289,34 @@ function requestSections(c) {
 /** Who gets what without asking (policy.json): auto and never, and what everything else does. */
 function policySection(c) {
   const p = readPolicy(c);
-  const rules = Object.entries(p.secrets).filter(([, r]) => r && (r.grant === 'auto' || r.grant === 'never'));
+  // A secret no house ever gets is the household's rule; who gets what without asking is each agent's (its tab).
+  const rules = Object.entries(p.secrets).filter(([, r]) => r && r.grant === 'never');
   const items = [
     { label: 'Anything else', value: p.default === 'ask' ? 'asks you' : p.default === 'auto' ? 'granted to any house' : 'refused' },
-    ...rules.map(([name, r]) => ({ label: name, value: r.grant === 'never' ? 'never' : `auto for ${(r.agents || []).join(', ') || 'nobody'}, ${r.minutes || 60} min` })),
+    ...rules.map(([name]) => ({ label: name, value: 'never' })),
   ];
   return { id: 'policy', side: true, title: 'Who gets what', blocks: [{ type: 'kv', items }, { type: 'text', tone: 'muted', text: `policy.json in ${c.dir}` }] };
 }
 
-function uiPage(c, req) {
+/** An agent's Secrets tab (loom docs/extensions.md, agentTab): what it gets without asking, and its requests. */
+function agentPage(c, agent) {
+  const gets = names(c).filter((name) => standing(c, name).includes(agent));
+  const p = readPolicy(c);
+  const auto = Object.entries(p.secrets).filter(([, r]) => r && r.grant === 'auto' && (r.agents || []).includes(agent));
+  const sections = [{ id: 'gets', title: 'It gets without asking', blocks: gets.length || auto.length ? [{ type: 'list', items: [
+    ...gets.map((name) => ({ text: name, meta: `every house of ${agent} gets it when it asks`,
+      act: { action: 'stop-always', label: 'Stop', tone: 'danger', fields: { name, agent }, confirm: `${agent}'s houses will ask you for ${name} again.` } })),
+    ...auto.filter(([name]) => !gets.includes(name)).map(([name, r]) => ({ text: name, meta: `by the policy, ${r.minutes || 60} min at a time` })),
+  ] }] : [{ type: 'text', tone: 'muted', text: `Nothing: ${agent}'s houses ask you for every secret they don't start with.` }] }];
+  const req = requestSections(c, agent);
+  sections.push(...(req.length ? req : [{ id: 'requests', title: 'Requests', blocks: [{ type: 'text', tone: 'muted', text: 'No requests yet.' }] }]));
+  return { title: 'Secrets', intro: `What ${agent}'s houses get without asking, and what they've asked for. Values are never shown.`, sections };
+}
+
+function uiPage(c, req, env = {}) {
   if (!req || typeof req.path !== 'string') return NOT_FOUND;
+  const scope = typeof env.LOOM_SCOPE === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(env.LOOM_SCOPE) ? env.LOOM_SCOPE : '';
+  if (scope && req.path === '') return agentPage(c, scope);
   const query = req.query && typeof req.query === 'object' ? req.query : {};
   // A name rides in the query: loom's page paths are lowercase, and names needn't be.
   if (req.path === 'secret') return secretPage(c, String(query.name ?? ''));
@@ -312,7 +332,12 @@ function uiPage(c, req) {
   const sections = [];
   if (!keyed) sections.push({ id: 'key', blocks: [{ type: 'callout', tone: 'bad', title: 'No age key',
     text: `There is no age key at ${c.key}, so nothing can be stored. Run: loom secrets init` }] });
-  sections.push(...requestSections(c));
+  // Each agent's requests and what it gets without asking are on its own Secrets tab; waiting ones are in the Inbox.
+  const agents = [...new Set(allRequests(c).map((r) => r.agent).concat(Object.values(readPolicy(c).secrets).flatMap((r) => (r && r.agents) || [])))]
+    .filter((a) => typeof a === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(a)).sort();
+  if (agents.length) sections.push({ id: 'agents', side: true, title: 'Each agent\'s secrets', blocks: [
+    { type: 'text', tone: 'muted', text: 'What each agent gets without asking, and what it has asked for: on its own Secrets tab.' },
+    { type: 'list', items: agents.map((a) => ({ text: a, agent: a, page: `agent:${a}` })) }] });
   sections.push({ id: 'store', blocks: shown.length
     ? [{ type: 'list', items: shown.map((name) => ({ text: name, page: `secret?name=${encodeURIComponent(name)}` })) }]
     : [{ type: 'text', tone: 'muted', text: 'Nothing stored yet.' }] });
@@ -382,6 +407,14 @@ function uiAct(c, env, req) {
   const no = (message) => ({ ok: false, message, page: '' });
   if (!req) return no('That request could not be read.');
   const action = req.action;
+  // From an agent's Secrets tab: that agent's requests and grants only.
+  const scope = typeof env?.LOOM_SCOPE === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(env.LOOM_SCOPE) ? env.LOOM_SCOPE : '';
+  if (scope) {
+    const f = req.fields && typeof req.fields === 'object' ? req.fields : {};
+    const theirs = Object.hasOwn(ANSWERS, action) ? allRequests(c).find((r) => r.id === f.id)?.agent === scope
+      : action === 'stop-always' ? f.agent === scope : false;
+    if (!theirs) return no(`This is ${scope}'s page.`);
+  }
   if (Object.hasOwn(ANSWERS, action)) {
     const id = req.fields?.id;
     if (typeof id !== 'string' || !/^q-[0-9a-f]{8}$/.test(id)) return no('That is not a request.');
@@ -567,7 +600,7 @@ export async function main(argv, io) {
       const sub = pos[0];
       if (sub === undefined) { io.stdout(JSON.stringify(uiManifest(c)) + '\n'); return 0; }
       if (pos.length > 1) throw new Fail(`usage: loom secrets ui [page|act] --json`, 2);
-      if (sub === 'page') { io.stdout(JSON.stringify(uiPage(c, await readRequest(io))) + '\n'); return 0; }
+      if (sub === 'page') { io.stdout(JSON.stringify(uiPage(c, await readRequest(io), io.env)) + '\n'); return 0; }
       if (sub === 'act') { io.stdout(JSON.stringify(uiAct(c, io.env, await readRequest(io))) + '\n'); return 0; }
       throw new Fail(`unknown ui command ${sub}\n${USAGE}`, 2);
     }
