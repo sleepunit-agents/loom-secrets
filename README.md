@@ -140,6 +140,12 @@ house:  piece-call secrets get onterris-gh        (works once granted, for that 
   and `audit.jsonl` (every request, answer, read and refused read) hold names,
   houses and reasons. `get` reads the value from the store for the granted
   house, through loom's piece API.
+- **Always allow.** A card also offers *Always allow <agent>*: this request is
+  granted, and the policy gives that secret to that agent's houses without
+  asking from now on (`auto`, 8 h a grant; each grant still ends with its
+  house). The secret's page lists who has it without asking, each with Stop,
+  which puts them back to asking (live grants stay until Revoke or expiry).
+  A secret whose policy is `never` can't be always-allowed.
 - **The owner can revoke** a live grant from the page's Requests.
 
 ## In loom's bundle
