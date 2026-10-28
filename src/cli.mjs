@@ -26,7 +26,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError, standing, stopAlways, forgetStanding } from './requests.mjs';
+import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError, standing, stopAlways, forgetStanding, stateOf } from './requests.mjs';
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const STORE = 'store.sops.json';
@@ -37,6 +37,8 @@ const USAGE = `Usage: loom secrets <command> [args]
   init                          Create the age key and an empty store
   add <name> [--force]          Store a value read from stdin (or a no-echo prompt)
   list [--json]                 Names only (never decrypts)
+  state <request id>            A request's state (pending, granted, denied,
+                                revoked, expired), for the clock parked on it
   rm <name>                     Delete a secret
   get <name> --reveal           Print a value: only at a terminal, or with
                                 LOOM_SECRETS_ALLOW_GET=1 set by the host side
@@ -595,6 +597,14 @@ export async function main(argv, io) {
       allow(['--json']);
       const req = await readRequest(io);
       io.stdout(JSON.stringify(await apiAnswer(c, io.env, req)) + '\n');
+      return 0;
+    }
+
+    case 'state': {
+      // loom's machine only (the clock parks a body on a request): its state, never a value.
+      allow([]);
+      if (pos.length !== 1 || !/^q-[0-9a-f]{8}$/.test(pos[0])) throw new Fail('usage: loom secrets state <request id>', 2);
+      try { io.stdout(stateOf(c, pos[0]) + '\n'); } catch (err) { throw new Fail(err.message, 3); }
       return 0;
     }
 

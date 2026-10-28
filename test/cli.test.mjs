@@ -659,3 +659,32 @@ test('requests: Always allow grants this one and every later house of that agent
   const audit = readFileSync(join(env.LOOM_SECRETS_DIR, 'audit.jsonl'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l).event);
   assert.ok(audit.includes('always') && audit.includes('stop-always'), audit.join(' '));
 });
+
+test('requests: the owner\'s yes outlives the house that asked, once; the clock reads a request\'s state by id', { skip }, () => {
+  cli(['add', 'carry-me'], { input: 'CARRIED' });
+  const q = api(house('h-50'), ['request', 'carry-me', '--why', 'pond work']);
+  const id = q.body.stdout.match(/q-[0-9a-f]{8}/)[0];
+  assert.equal(cli(['state', id]).stdout, 'pending\n');
+  const card = JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.text.includes('carry-me'));
+  cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'grant', fields: card.actions[0].fields }) });
+  assert.equal(cli(['state', id]).stdout, 'granted\n');
+  // h-50 is gone; art's next house asks and gets it at once, without a second card.
+  const next = api(house('h-51'), ['request', 'carry-me', '--why', 'resuming']);
+  assert.match(next.body.stdout, /granted/);
+  assert.equal(api(house('h-51'), ['get', 'carry-me']).body.stdout, 'CARRIED');
+  assert.equal(JSON.parse(cli(['ui', '--json']).stdout).asks.filter((a) => a.text.includes('carry-me')).length, 0);
+  // Once: a third house asks the owner again; another agent, or the agent's service, never carries it.
+  assert.match(api(house('h-52'), ['request', 'carry-me', '--why', 'again']).body.stdout, /asked the owner/);
+  assert.match(api(house('h-53', 'mark'), ['request', 'carry-me', '--why', 'x']).body.stdout, /asked the owner/);
+  assert.match(api({ ...house('h-54'), service: 'discord' }, ['request', 'carry-me', '--why', 'x']).body.stdout, /asked the owner/);
+  // A refusal doesn't carry.
+  cli(['add', 'no-carry'], { input: 'N' });
+  api(house('h-60'), ['request', 'no-carry', '--why', 'x']);
+  const nc = JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.text.includes('no-carry'));
+  cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'deny', fields: nc.actions.find((a) => a.action === 'deny').fields }) });
+  assert.match(api(house('h-61'), ['request', 'no-carry', '--why', 'y']).body.stdout, /asked the owner/);
+  // state: a bad or unknown id is refused, and houses can't call it through the API.
+  assert.equal(cli(['state', 'nope']).status, 2);
+  assert.equal(cli(['state', 'q-00000000']).status, 3);
+  assert.notEqual(api(house('h-51'), ['state', id]).body.exit, 0);
+});
