@@ -96,7 +96,7 @@ function audit(c, event) {
 /** A request is the whole caller's: its agent, its house, and its service if it has one. */
 const sameCaller = (r, h) => r.house === h.house && r.agent === h.agent && (r.service ?? null) === (h.service ?? null);
 const live = (r, now = Date.now()) => r.state === 'granted' && Date.parse(r.expires) > now;
-const view = (r) => ({ ...(r.always ? { always: true } : {}), ...(r.carriedFrom ? { carriedFrom: r.carriedFrom } : {}), id: r.id, secret: r.secret, agent: r.agent, house: r.house, state: live(r) ? 'granted' : r.state === 'granted' ? 'expired' : r.state, why: r.why, minutes: r.minutes, at: r.at, ...(r.expires ? { expires: r.expires } : {}), ...(r.decided ? { decided: r.decided } : {}), ...(r.by ? { by: r.by } : {}) });
+const view = (r) => ({ ...(r.always ? { always: true } : {}), ...(r.carriedFrom ? { carriedFrom: r.carriedFrom } : {}), id: r.id, secret: r.secret, agent: r.agent, house: r.house, state: live(r) ? 'granted' : r.state === 'granted' ? 'expired' : r.state, why: r.why, minutes: r.minutes, at: r.at, ...(r.expires ? { expires: r.expires } : {}), ...(r.decided ? { decided: r.decided } : {}), ...(r.by ? { by: r.by } : {}), ...(r.who ? { who: r.who } : {}) });
 
 /** The house a caller is: only a house's own token (agent, with its house) asks or reads. */
 function houseOf(caller) {
@@ -221,16 +221,17 @@ export function forgetStanding(c, secret) {
 }
 
 /** The owner stops an agent getting a secret without asking. Its live grants stay (Revoke ends those). */
-export function stopAlways(c, secret, agent) {
+export function stopAlways(c, secret, agent, who) {
   return locked(c, () => {
     if (!standing(c, secret).includes(agent)) throw new RequestError(`${agent} doesn't get ${secret} without asking`, 409);
     setAuto(c, secret, agent, false);
-    audit(c, { event: 'stop-always', secret, agent, by: 'owner' });
+    audit(c, { event: 'stop-always', secret, agent, by: 'owner', ...(who ? { who } : {}) });
   });
 }
 
 /** The owner answers a request (the page): grant, always (grant, and auto from now on), deny, or revoke a live grant. */
-export function answer(c, id, action) {
+/** who: the member who answered (loom's caller, docs/specs/owners.md in loom); kept beside by: 'owner'. */
+export function answer(c, id, action, who) {
   return locked(c, () => {
     const d = load(c);
     const r = d.requests[id];
@@ -240,6 +241,7 @@ export function answer(c, id, action) {
       if (r.state !== 'pending') throw new RequestError(`that request is already ${view(r).state}`, 409);
       r.state = action === 'grant' ? 'granted' : 'denied';
       r.by = 'owner';
+      if (who) r.who = who;
       r.decided = now.toISOString();
       if (action === 'grant') r.expires = new Date(now.getTime() + r.minutes * 60_000).toISOString();
     } else if (action === 'always') {
@@ -250,6 +252,7 @@ export function answer(c, id, action) {
       setAuto(c, r.secret, r.agent, true);
       r.state = 'granted';
       r.by = 'owner';
+      if (who) r.who = who;
       r.always = true;
       r.minutes = MAX_MINUTES;
       r.decided = now.toISOString();
@@ -264,7 +267,7 @@ export function answer(c, id, action) {
       }
     } else throw new RequestError('no such answer');
     save(c, d);
-    audit(c, { event: action, id, secret: r.secret, agent: r.agent, house: r.house, by: 'owner' });
+    audit(c, { event: action, id, secret: r.secret, agent: r.agent, house: r.house, by: 'owner', ...(who ? { who } : {}) });
     return view(r);
   });
 }
