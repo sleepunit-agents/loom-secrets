@@ -672,6 +672,8 @@ test('requests: the owner\'s yes outlives the house that asked, once; the clock 
   const next = api(house('h-51'), ['request', 'carry-me', '--why', 'resuming']);
   assert.match(next.body.stdout, /granted/);
   assert.equal(api(house('h-51'), ['get', 'carry-me']).body.stdout, 'CARRIED');
+  // It moved: the house that asked (were it still up) reads it no more.
+  assert.equal(api(house('h-50'), ['get', 'carry-me']).status, 403);
   assert.equal(JSON.parse(cli(['ui', '--json']).stdout).asks.filter((a) => a.text.includes('carry-me')).length, 0);
   // Once: a third house asks the owner again; another agent, or the agent's service, never carries it.
   assert.match(api(house('h-52'), ['request', 'carry-me', '--why', 'again']).body.stdout, /asked the owner/);
@@ -683,6 +685,15 @@ test('requests: the owner\'s yes outlives the house that asked, once; the clock 
   const nc = JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.text.includes('no-carry'));
   cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'deny', fields: nc.actions.find((a) => a.action === 'deny').fields }) });
   assert.match(api(house('h-61'), ['request', 'no-carry', '--why', 'y']).body.stdout, /asked the owner/);
+  // Revoking the original ends the carried one too.
+  const live1 = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }) }).stdout)
+    .sections.find((s) => s.id === 'requests').blocks[0].items.find((i) => i.text.includes('carry-me') && i.act && i.meta.startsWith('h-50'));
+  if (live1) {
+    cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'revoke', fields: live1.act.fields }) });
+    assert.equal(api(house('h-51'), ['get', 'carry-me']).status, 403);
+  } else {
+    assert.fail('the original grant is still listed as live, with Revoke');
+  }
   // state: a bad or unknown id is refused, and houses can't call it through the API.
   assert.equal(cli(['state', 'nope']).status, 2);
   assert.equal(cli(['state', 'q-00000000']).status, 3);
