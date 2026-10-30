@@ -33,6 +33,7 @@ before(() => {
     LOOM_SECRETS_SOPS: SOPS,
     LOOM_SECRETS_AGE_KEYGEN: KEYGEN,
     LOOM_SECRETS_PODMAN: fakePodman,
+    TZ: 'America/Chicago',  // the box's local time, which the page's times are in
   };
 });
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -544,19 +545,22 @@ test('requests: ask by default, the owner allows on the page, and only that hous
   const m = JSON.parse(cli(['ui', '--json']).stdout);
   assert.equal(m.asks.length, 1);
   const ask = m.asks[0];
-  assert.match(ask.text, /art asks for onterris-gh/);
-  assert.match(ask.meta, /h-7.*push the fix for onterris\/pond#212 b now \/b/);
+  assert.equal(ask.text, 'Art asks for onterris-gh');
+  // No house id leads it: how long, and the house's reason as written.
+  assert.match(ask.meta, /^For \d+ min: \u201cpush the fix for onterris\/pond#212 b now \/b\u201d$/);
+  assert.match(ask.actions[1].confirm, /^Every house of Art gets onterris-gh without asking, 8 hours at a time,/);
   assert.deepEqual(ask.actions.map((a) => a.action), ['grant', 'always', 'deny']);
   // Waiting: no value yet.
   assert.equal(api(house('h-7'), ['get', 'onterris-gh']).status, 403);
   const act = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'grant', fields: ask.actions[0].fields }) }).stdout);
   assert.equal(act.ok, true, act.message);
+  assert.match(act.message, /^Allowed: Art's onterris-gh, for \d+ min\.$/);
   assert.equal(JSON.parse(cli(['ui', '--json']).stdout).asks.length, 0);
   // loom's Inbox: the card was a permission, and what was answered is its history.
   assert.equal(ask.kind, 'permission');
   const after = JSON.parse(cli(['ui', '--json']).stdout).answered;
   assert.equal(after.length, 1);
-  assert.match(after[0].text, /^art asked for onterris-gh/);
+  assert.match(after[0].text, /^Art asked for onterris-gh/);
   assert.equal(after[0].outcome, `Allowed for ${ask.actions[0].label.match(/\d+/)[0]} min.`);
   const got = api(house('h-7'), ['get', 'onterris-gh']);
   assert.equal(got.body.stdout, 'ghp_ONTERRIS_VALUE');
@@ -566,10 +570,15 @@ test('requests: ask by default, the owner allows on the page, and only that hous
   const page = cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: 'art' } }).stdout;
   assert.ok(!page.includes('ghp_ONTERRIS_VALUE'));
   const live = JSON.parse(page).sections.find((s) => s.id === 'requests').blocks[0].items[0];
+  // A live grant: its state in words and when it runs out, in the box's 12-hour local time; no house id, no UTC.
+  assert.equal(live.text, 'Art · onterris-gh');
+  assert.match(live.meta, /^Granted until \d{1,2}:\d{2} [AP]M( \u00b7 |$)/);
+  assert.doesNotMatch(live.meta, /h-7|UTC/);
+  assert.equal(live.act.confirm, "That house won't be able to read onterris-gh again.");
   // The household's page doesn't list them: it links each agent's tab.
   const home = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }) }).stdout);
   assert.equal(home.sections.find((s) => s.id === 'requests'), undefined);
-  assert.deepEqual(home.sections.find((s) => s.id === 'agents').blocks[1].items.map((i) => i.page), ['agent:art']);
+  assert.deepEqual(home.sections.find((s) => s.id === 'agents').blocks[1].items.map((i) => [i.text, i.agent, i.page]), [['Art', 'art', 'agent:art']]);
   // From mark's tab, art's request is not mark's to revoke.
   const other = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'revoke', fields: live.act.fields }), extraEnv: { LOOM_SCOPE: 'mark' } }).stdout);
   assert.equal(other.ok, false);
@@ -617,11 +626,11 @@ test('requests: Always allow grants this one and every later house of that agent
   const ask = JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.text.includes('onterris-always'));
   assert.deepEqual(ask.actions.map((a) => a.action), ['grant', 'always', 'deny']);
   const always = ask.actions.find((a) => a.action === 'always');
-  assert.match(always.label, /Always allow art/);
+  assert.equal(always.label, 'Always allow Art');
   assert.ok(always.confirm, 'a standing grant asks to be sure');
   const act = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'always', fields: always.fields }) }).stdout);
   assert.equal(act.ok, true, act.message);
-  assert.match(act.message, /without asking/);
+  assert.equal(act.message, "Allowed: Art's onterris-always, and Art's houses get it without asking from now on.");
   // This house has it, and for a house's working day.
   assert.equal(api(house('h-30'), ['get', 'onterris-always']).body.stdout, 'ONTERRIS');
   assert.equal(JSON.parse(api(house('h-30'), ['status']).body.stdout)[0].minutes, 480);
@@ -636,10 +645,14 @@ test('requests: Always allow grants this one and every later house of that agent
   // The secret's page says who has it without asking, and the owner can stop it there.
   const page = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: 'secret', query: { name: 'onterris-always' } }) }).stdout);
   const standing = page.sections.find((s) => s.id === 'standing');
-  const row = standing.blocks[0].items.find((i) => i.text === 'art');
+  const row = standing.blocks[0].items.find((i) => i.text === 'Art');
+  assert.equal(row.meta, 'Every house of Art gets it when it asks');
   assert.equal(row.act.action, 'stop-always');
+  assert.deepEqual(row.act.fields, { name: 'onterris-always', agent: 'art' }, 'the agent id itself is unchanged');
+  assert.equal(row.act.confirm, "Art's houses will ask you for onterris-always again.");
   const stop = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'stop-always', fields: row.act.fields }) }).stdout);
   assert.equal(stop.ok, true, stop.message);
+  assert.equal(stop.message, "Art's houses will ask for onterris-always again.");
   assert.match(api(house('h-33'), ['request', 'onterris-always', '--why', 'again']).body.stdout, /asked the owner/);
   assert.deepEqual(JSON.parse(readFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), 'utf-8')).secrets['onterris-always'],
     { grant: 'ask', minutes: 480 }, 'Stop leaves the length as Always set it');
@@ -648,6 +661,9 @@ test('requests: Always allow grants this one and every later house of that agent
   cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'always', fields: (api(house('h-39'), ['request', 'onterris-always', '--why', 'x']),
     JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.text.includes('onterris-always')).actions[1].fields) }) });
   assert.deepEqual(tab('art').sections.find((s) => s.id === 'gets').blocks[0].items.map((i) => [i.text, i.act?.action]), [['onterris-always', 'stop-always']]);
+  assert.equal(tab('art').sections.find((s) => s.id === 'gets').blocks[0].items[0].act.confirm, "Art's houses will ask you for onterris-always again.");
+  assert.match(tab('art').intro, /^What Art's houses get without asking/);
+  assert.equal(tab('mark').sections.find((s) => s.id === 'gets').blocks[0].text, "Nothing: Mark's houses ask you for every secret they don't start with.");
   assert.equal(tab('mark').sections.find((s) => s.id === 'gets').blocks[0].type, 'text');
   assert.equal(JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'stop-always', fields: { name: 'onterris-always', agent: 'art' } }),
     extraEnv: { LOOM_SCOPE: 'mark' } }).stdout).ok, false, "mark's tab can't stop art's");
@@ -706,7 +722,7 @@ test('requests: the owner\'s yes outlives the house that asked, once; the clock 
   assert.match(api(house('h-61'), ['request', 'no-carry', '--why', 'y']).body.stdout, /asked the owner/);
   // Revoking the original ends the carried one too.
   const live1 = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: 'art' } }).stdout)
-    .sections.find((s) => s.id === 'requests').blocks[0].items.find((i) => i.text.includes('carry-me') && i.act && i.meta.startsWith('h-50'));
+    .sections.find((s) => s.id === 'requests').blocks[0].items.find((i) => i.text.includes('carry-me') && i.act && i.meta.includes('\u201cpond work\u201d'));
   if (live1) {
     cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'revoke', fields: live1.act.fields }) });
     assert.equal(api(house('h-51'), ['get', 'carry-me']).status, 403);
@@ -736,4 +752,28 @@ test('requests: an answer records who gave it (the caller loom names), and the h
   cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'deny', fields: ask2.actions.find((a) => a.action === 'deny').fields, caller: { kind: 'owner', who: 'Not A Slug' } }) });
   const denied = JSON.parse(cli(['ui', '--json']).stdout).answered.find((a) => a.outcome.startsWith('Denied'));
   assert.equal(denied.outcome, 'Denied.');
+});
+
+test('requests: a grant row says its state in words and its time in the box\'s 12-hour local time, with the date if not today', { skip }, () => {
+  cli(['add', 'when-ends'], { input: 'W' });
+  for (const h of ['h-80', 'h-81', 'h-82', 'h-83']) api(house(h), ['request', 'when-ends', '--why', `ask from ${h}`]);
+  const file = join(env.LOOM_SECRETS_DIR, 'requests.json');
+  const d = JSON.parse(readFileSync(file, 'utf-8'));
+  const of = (h) => Object.values(d.requests).find((r) => r.secret === 'when-ends' && r.house === h);
+  const later = new Date(Date.now() + 3 * 86_400_000);
+  later.setHours(15, 5, 0, 0);
+  const nextYear = new Date(later.getFullYear() + 1, 0, 2, 9, 7);
+  Object.assign(of('h-80'), { state: 'granted', by: 'owner', decided: of('h-80').at, expires: later.toISOString() });
+  Object.assign(of('h-81'), { state: 'granted', by: 'owner', decided: of('h-81').at, expires: nextYear.toISOString() });
+  Object.assign(of('h-82'), { state: 'granted', by: 'owner', decided: of('h-82').at, expires: new Date(Date.now() - 60_000).toISOString() });
+  writeFileSync(file, JSON.stringify(d));
+  const items = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: 'art' } }).stdout)
+    .sections.find((s) => s.id === 'requests').blocks[0].items.filter((i) => i.text === 'Art · when-ends');
+  const meta = (h) => items.find((i) => i.meta.includes(`ask from ${h}`)).meta;
+  const month = later.toLocaleDateString('en-US', { month: 'short' });
+  assert.equal(meta('h-80'), `Granted until ${month} ${later.getDate()}, 3:05 PM \u00b7 \u201cask from h-80\u201d`);
+  assert.equal(meta('h-81'), `Granted until Jan 2, ${nextYear.getFullYear()}, 9:07 AM \u00b7 \u201cask from h-81\u201d`);
+  assert.equal(meta('h-82'), 'Expired \u00b7 \u201cask from h-82\u201d');
+  assert.equal(meta('h-83'), 'Waiting on you \u00b7 \u201cask from h-83\u201d');
+  for (const i of items) assert.doesNotMatch(i.meta, /UTC|\d{4}-\d{2}-\d{2}|^h-\d/);
 });
