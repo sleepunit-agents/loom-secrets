@@ -88,12 +88,22 @@ echo '{"path":"","query":{}}' | loom-secrets ui page --json
 echo '{"action":"add","path":"","fields":{"name":"x","value":"..."}}' | loom-secrets ui act --json
 ```
 
-The page (`""`) has an **Add a secret** form and **In the store**, which lists
-names. Each name folds open to a **Replace** form and a **Remove** button.
-`ui act` takes `add` (refuses a name that exists and points to Replace),
-`replace` (the name must exist) and `remove`. It answers
-`{ok, message, page: ""}`. A store bigger than one page allows (160 names) is
-split into parts, picked with `?part=`.
+The page (`""`) is an app panel (loom's `docs/extensions.md`, "Panels"):
+**Add a secret** is a row whose sheet takes the name and the value; **In the
+store** is a row for each name, saying who gets it ("Art at start") and when a
+house last got it ("Last given to Art's house 5 min ago", from the audit), with
+a search and a filter (`?q=`, `?who=start|asked|ask|never`). A secret's own page
+(`secret?name=<n>`) has its **Value** row (Replace, in a sheet), **Who gets it**:
+two switches an agent, *When a house starts* (`houses`) and *When a house asks*
+(`auto`, without asking you), its waiting requests (each answer in a sheet), live
+grants (each with Revoke), what was asked before (each reason whole), and Remove;
+its rule and request ids sit behind *The record*. `ui act` takes `add` (refuses a
+name that exists and points to Replace), `replace` (the name must exist),
+`remove`, the switches `houses` and `auto` (`{name, agent, on: "on"|""}`), the
+answers `grant`, `always`, `deny`, `revoke` and `stop-always`. It answers
+`{ok, message, page: ""}`. A store bigger than one page allows (200 names) is
+split into parts, picked with `?part=`. Each agent's tab (`LOOM_SCOPE`) shows
+what that agent gets, its waiting, live and past requests, and its own switches.
 
 The page is **write-only**: you can put a value in, but you can't read it back
 (ac-sec-ui-*). A value typed into the form goes to loom, which checks the
@@ -143,8 +153,8 @@ house:  piece-call secrets get onterris-gh        (works once granted, for that 
 - **Always allow.** A card also offers *Always allow <agent>*: this request is
   granted, and the policy gives that secret to that agent's houses without
   asking from now on (`auto`, 8 h a grant; each grant still ends with its
-  house). The secret's page lists who has it without asking, each with Stop,
-  which puts them back to asking (live grants stay until Revoke or expiry).
+  house). The secret's page shows who has it without asking as a switch; turning it
+  off puts them back to asking (live grants stay until Revoke or expiry).
   A secret whose policy is `never` can't be always-allowed.
 - **A yes outlives the house that asked.** By the time the owner answers, the
   house that asked has usually ended (its body parked: `wake park --on q-…`,

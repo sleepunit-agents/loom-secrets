@@ -26,7 +26,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError, standing, stopAlways, forgetStanding, stateOf, may, setHouses, auditIssue } from './requests.mjs';
+import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError, standing, stopAlways, forgetStanding, stateOf, may, setHouses, setAlways, auditIssue } from './requests.mjs';
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const STORE = 'store.sops.json';
@@ -281,145 +281,277 @@ const OUTCOME = {
 
 function answeredRequests(c) {
   return allRequests(c).filter((r) => OUTCOME[r.state]).slice(0, 20).map((r) => ({
-    text: `${named(r.agent)} asked for ${r.secret}: \u201c${r.why}\u201d`.slice(0, 300), outcome: OUTCOME[r.state](r),
-    at: r.decided ?? r.at, kind: 'permission', agent: r.agent, page: '',
+    text: `${named(r.agent)} asked for ${r.secret}: “${r.why}”`.slice(0, 300), outcome: OUTCOME[r.state](r),
+    at: r.decided ?? r.at, kind: 'permission', agent: r.agent, page: secretLink(r.secret),
   }));
 }
+
+/** A request's three answers, as an ask's actions and as the buttons in its sheet. */
+const answers = (r) => [
+  { action: 'grant', label: `Allow ${r.minutes} min`, tone: 'primary', fields: { id: r.id } },
+  { action: 'always', label: `Always allow ${named(r.agent)}`, fields: { id: r.id },
+    confirm: `Every house of ${named(r.agent)} gets ${r.secret} without asking, 8 hours at a time, until you stop it on the secret's page.` },
+  { action: 'deny', label: 'Deny', tone: 'danger', fields: { id: r.id } },
+];
 
 function pendingAsks(c) {
   return allRequests(c).filter((r) => r.state === 'pending').slice(0, 10).map((r) => ({
     text: `${named(r.agent)} asks for ${r.secret}`,
-    meta: `For ${r.minutes} min: \u201c${r.why}\u201d`,
-    tone: 'warn', at: r.at, agent: r.agent, page: '', kind: 'permission',
-    actions: [
-      { action: 'grant', label: `Allow ${r.minutes} min`, tone: 'primary', fields: { id: r.id } },
-      { action: 'always', label: `Always allow ${named(r.agent)}`, fields: { id: r.id },
-        confirm: `Every house of ${named(r.agent)} gets ${r.secret} without asking, 8 hours at a time, until you stop it on the secret's page.` },
-      { action: 'deny', label: 'Deny', tone: 'danger', fields: { id: r.id } },
-    ],
+    meta: `For ${r.minutes} min: “${r.why}”`,
+    tone: 'warn', at: r.at, agent: r.agent, page: secretLink(r.secret), kind: 'permission',
+    actions: answers(r),
   }));
 }
 
-/** The page's Requests: what's waiting, what's live (each revocable), and what was decided. */
-function requestSections(c, only) {
-  const rs = allRequests(c).filter((r) => !only || r.agent === only);
-  if (!rs.length) return [];
-  const item = (r) => ({
-    text: `${named(r.agent)} · ${r.secret}`,
-    meta: `${STATE[r.state] ?? r.state}${r.expires && r.state === 'granted' ? ` until ${when(r.expires)}` : ''} · \u201c${r.why}\u201d`,
-    tone: r.state === 'pending' ? 'warn' : r.state === 'granted' ? 'ok' : undefined,
-    ...(r.state === 'granted' ? { act: { action: 'revoke', label: 'Revoke', tone: 'danger', fields: { id: r.id }, confirm: `That house won't be able to read ${r.secret} again.` } } : {}),
-  });
-  return [{ id: 'requests', title: 'Requests', blocks: [{ type: 'list', items: rs.slice(0, 20).map(item) }] }];
+/** A secret's own page: its name rides in the query (loom's page paths are lowercase, names needn't be). */
+const secretLink = (name) => `secret?name=${encodeURIComponent(name)}`;
+
+/** How long ago, in words: "just now", "5 min ago", "3 hours ago", "yesterday", "4 days ago", else the date. */
+function ago(iso, now = new Date()) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return '';
+  const s = Math.max(0, (now.getTime() - t) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86_400) { const h = Math.floor(s / 3600); return `${h} hour${h === 1 ? '' : 's'} ago`; }
+  const d = Math.floor(s / 86_400);
+  if (d === 1) return 'yesterday';
+  if (d < 7) return `${d} days ago`;
+  return `on ${when(iso, now).replace(/, \d{1,2}:\d{2} [AP]M$/, '')}`;
 }
 
-/** Who gets what without asking (policy.json): auto and never, and what everything else does. */
+/** When each secret was last handed to a house (a house starting, or a read with a grant): from the audit, never a value. */
+function lastUse(c) {
+  const out = new Map();
+  let text = '';
+  try { text = readFileSync(join(c.dir, 'audit.jsonl'), 'utf-8'); } catch { return out; }
+  for (const line of text.split('\n')) {
+    if (!line.includes('"issue"') && !line.includes('"read"')) continue;
+    let e;
+    try { e = JSON.parse(line); } catch { continue; }
+    if ((e.event !== 'issue' && e.event !== 'read') || typeof e.secret !== 'string' || typeof e.at !== 'string') continue;
+    const prev = out.get(e.secret);
+    if (!prev || e.at > prev.at) out.set(e.secret, { at: e.at, agent: e.agent, how: e.event });
+  }
+  return out;
+}
+
+const usedWords = (u) => (u ? `Last given to ${named(u.agent)}'s house ${ago(u.at)}` : 'Not given to a house yet');
+
+/** The agents the store knows of: in the policy or in a request. */
+function knownAgents(c) {
+  const p = readPolicy(c);
+  return [...new Set(allRequests(c).map((r) => r.agent)
+    .concat(Object.values(p.secrets).flatMap((r) => (r && typeof r === 'object' ? [...(Array.isArray(r.agents) ? r.agents : []), ...(Array.isArray(r.houses) ? r.houses : [])] : []))))]
+    .filter((a) => typeof a === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(a)).sort();
+}
+
+/** What one agent gets of one secret: at start (houses), when a house asks without you (auto), never, or neither. */
+function givenTo(rule, agent) {
+  const r = rule && typeof rule === 'object' ? rule : {};
+  if (r.grant === 'never') return { never: true, start: false, auto: false };
+  return { never: false, start: Array.isArray(r.houses) && r.houses.includes(agent),
+    auto: r.grant === 'auto' && Array.isArray(r.agents) && r.agents.includes(agent) };
+}
+
+const givesWords = (g) => (g.never ? 'Never given out' : g.start && g.auto ? 'At start, and when a house asks'
+  : g.start ? 'When a house starts' : g.auto ? 'When a house asks, without you' : 'Asks you first');
+
+/** Who gets a secret, in words: "Art at start, Mark when asked", "Never given out", "Asks you first". */
+function whoGetsWords(policy, agents, name) {
+  const rule = policy.secrets[name];
+  if (rule?.grant === 'never') return 'Never given out';
+  const parts = agents.map((a) => [a, givenTo(rule, a)]).filter(([, g]) => g.start || g.auto)
+    .map(([a, g]) => `${named(a)} ${g.start && g.auto ? 'at start and when asked' : g.start ? 'at start' : 'when asked'}`);
+  return parts.length ? parts.join(', ') : 'Asks you first';
+}
+
+/** Which way a secret is given, for the store's filter. */
+function givenKind(policy, agents, name) {
+  const rule = policy.secrets[name];
+  if (rule?.grant === 'never') return 'never';
+  const gs = agents.map((a) => givenTo(rule, a));
+  return gs.some((g) => g.start) ? 'start' : gs.some((g) => g.auto) ? 'asked' : 'ask';
+}
+
+/** The place a request came from, in words: "Art's house", "Art's slack house". */
+const houseWords = (r) => `${named(r.agent)}'s ${r.service ? `${String(r.service).replace(/-/g, ' ')} ` : ''}house`;
+
+/** Requests waiting on the owner: a row each, its answers in a sheet (the Inbox has the same card). */
+function waitingSection(rs) {
+  const waiting = rs.filter((r) => r.state === 'pending');
+  if (!waiting.length) return [];
+  return [{ id: 'waiting', title: 'Waiting on you', tone: 'warn', blocks: [{ type: 'panel', rows: waiting.slice(0, 20).map((r) => ({
+    label: `${named(r.agent)} asks for ${r.secret}`, agent: r.agent, tone: 'warn',
+    value: `“${r.why}”`, detail: `For ${r.minutes} min · asked ${ago(r.at)}`,
+    sheet: { title: `${named(r.agent)} asks for ${r.secret}`, blocks: [
+      { type: 'text', text: `“${r.why}”` },
+      { type: 'text', tone: 'muted', text: `From ${houseWords(r)}, ${ago(r.at)}. Allowing it lets that house read ${r.secret} for ${r.minutes} min.` },
+      { type: 'buttons', items: answers(r) },
+    ] },
+  })) }] }];
+}
+
+/** Live grants, each a row with Revoke. */
+function liveSection(rs) {
+  const live = rs.filter((r) => r.state === 'granted');
+  if (!live.length) return [];
+  return [{ id: 'grants', title: 'Live grants', blocks: [{ type: 'panel', rows: live.slice(0, 50).map((r) => ({
+    label: `${houseWords(r)} · ${r.secret}`, agent: r.agent, tone: 'ok',
+    value: `Can read it until ${when(r.expires)}`, detail: `“${r.why}”`,
+    act: { action: 'revoke', label: 'Revoke', tone: 'danger', fields: { id: r.id }, confirm: `That house won't be able to read ${r.secret} again.` },
+  })) }] }];
+}
+
+/** What was asked before and how it went: each house's reason whole, never cut. */
+function pastSection(rs, { withSecret }) {
+  const past = rs.filter((r) => r.state !== 'pending' && r.state !== 'granted');
+  if (!past.length) return [];
+  return [{ id: 'requests', title: 'Asked before', fold: 'open', blocks: [{ type: 'list', wrap: true, items: past.slice(0, 60).map((r) => ({
+    text: withSecret ? r.secret : houseWords(r), agent: r.agent,
+    meta: `${STATE[r.state] ?? r.state} · ${ago(r.decided ?? r.at)} · “${r.why}”`,
+    tone: r.state === 'denied' || r.state === 'revoked' ? 'muted' : undefined,
+  })) }] }];
+}
+
+/** Who gets what without asking (policy.json), for the household: what everything else does, and what's never given. */
 function policySection(c) {
   const p = readPolicy(c);
-  // A secret no house ever gets is the household's rule; who gets what without asking is each agent's (its tab).
-  const rules = Object.entries(p.secrets).filter(([, r]) => r && r.grant === 'never');
-  const items = [
-    { label: 'Anything else', value: p.default === 'ask' ? 'asks you' : p.default === 'auto' ? 'granted to any house' : 'refused' },
-    ...rules.map(([name]) => ({ label: name, value: 'never' })),
-  ];
-  return { id: 'policy', side: true, title: 'Who gets what', blocks: [{ type: 'kv', items }, { type: 'text', tone: 'muted', text: `policy.json in ${c.dir}` }] };
+  const never = Object.entries(p.secrets).filter(([, r]) => r && r.grant === 'never').map(([name]) => name);
+  return { id: 'policy', side: true, title: 'Who gets what', blocks: [{ type: 'panel', rows: [
+    { label: 'A secret not given out', value: p.default === 'ask' ? 'A house asks you for it' : p.default === 'auto' ? 'Any house gets it when it asks' : 'Refused' },
+    { label: 'Never given out', value: never.length ? never.join(', ') : 'Nothing' },
+    { label: 'The policy file', value: 'Where these rules are kept',
+      sheet: { title: 'The policy file', blocks: [{ type: 'code', label: 'policy.json', text: join(c.dir, 'policy.json') },
+        { type: 'text', tone: 'muted', text: 'Each secret’s rule: houses (given when a house starts), grant auto with agents (given when a house asks), or never.' }] } },
+  ] }] };
 }
 
-/** An agent's Secrets tab (loom docs/extensions.md, agentTab): what it gets without asking, and its requests. */
+/** An agent's Secrets tab (loom docs/extensions.md, agentTab): what it gets, what's waiting, what's live, what it asked. */
 function agentPage(c, agent) {
-  const gets = names(c).filter((name) => standing(c, name).includes(agent));
   const p = readPolicy(c);
-  const auto = Object.entries(p.secrets).filter(([, r]) => r && r.grant === 'auto' && (r.agents || []).includes(agent));
-  const sections = [{ id: 'gets', title: 'It gets without asking', blocks: gets.length || auto.length ? [{ type: 'list', items: [
-    ...gets.map((name) => ({ text: name, meta: `Every house of ${named(agent)} gets it when it asks`,
-      act: { action: 'stop-always', label: 'Stop', tone: 'danger', fields: { name, agent }, confirm: `${named(agent)}'s houses will ask you for ${name} again.` } })),
-    ...auto.filter(([name]) => !gets.includes(name)).map(([name, r]) => ({ text: name, meta: `By the policy, ${r.minutes || 60} min at a time` })),
-  ] }] : [{ type: 'text', tone: 'muted', text: `Nothing: ${named(agent)}'s houses ask you for every secret they don't start with.` }] }];
-  const req = requestSections(c, agent);
-  sections.push(...(req.length ? req : [{ id: 'requests', title: 'Requests', blocks: [{ type: 'text', tone: 'muted', text: 'No requests yet.' }] }]));
-  return { title: 'Secrets', intro: `What ${named(agent)}'s houses get without asking, and what they've asked for. Values are never shown.`, sections };
+  const uses = lastUse(c);
+  const gets = names(c).map((name) => [name, givenTo(p.secrets[name], agent)]).filter(([, g]) => !g.never && (g.start || g.auto));
+  const rs = allRequests(c).filter((r) => r.agent === agent);
+  const sections = [...waitingSection(rs), { id: 'gets', title: `What ${named(agent)} gets`, blocks: gets.length
+    ? [{ type: 'panel', rows: gets.map(([name, g]) => ({ label: name, value: givesWords(g), detail: usedWords(uses.get(name)), page: secretLink(name) })) }]
+    : [{ type: 'text', tone: 'muted', text: `Nothing: ${named(agent)}'s houses ask you for every secret they don't start with.` }] },
+  ...liveSection(rs), ...pastSection(rs, { withSecret: true })];
+  if (!rs.length) sections.push({ id: 'requests', title: 'Asked before', blocks: [{ type: 'text', tone: 'muted', text: 'No requests yet.' }] });
+  return { title: 'Secrets', intro: `What ${named(agent)}'s houses get, and what they've asked for. Values are never shown.`, sections };
 }
+
+const WHO_FILTER = [
+  { value: '', label: 'All' }, { value: 'start', label: 'At start' }, { value: 'asked', label: 'Without asking' },
+  { value: 'ask', label: 'Asks you' }, { value: 'never', label: 'Never' },
+];
 
 function uiPage(c, req, env = {}) {
   if (!req || typeof req.path !== 'string') return NOT_FOUND;
   const scope = typeof env.LOOM_SCOPE === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(env.LOOM_SCOPE) ? env.LOOM_SCOPE : '';
-  if (scope && req.path === '') return agentPage(c, scope);
   const query = req.query && typeof req.query === 'object' ? req.query : {};
-  // A name rides in the query: loom's page paths are lowercase, and names needn't be.
-  if (req.path === 'secret') return secretPage(c, String(query.name ?? ''));
+  if (req.path === 'secret') return secretPage(c, String(query.name ?? ''), scope);
   if (req.path !== '') return NOT_FOUND;
+  if (scope) return agentPage(c, scope);
+  const policy = readPolicy(c);
+  const agents = knownAgents(c);
+  const uses = lastUse(c);
   const all = names(c);
   const keyed = existsSync(c.key);
-  const parts = Math.max(1, Math.ceil(all.length / PER_PART));
+  const who = WHO_FILTER.some((o) => o.value && o.value === query.who) ? query.who : '';
+  const q = typeof query.q === 'string' ? query.q.trim().toLowerCase().slice(0, 64) : '';
+  const matching = all.filter((name) => (!q || name.toLowerCase().includes(q)) && (!who || givenKind(policy, agents, name) === who));
+  const parts = Math.max(1, Math.ceil(matching.length / PER_PART));
   let part = /^[1-9][0-9]{0,5}$/.test(String(query.part ?? '')) ? Number(query.part) : 1;
   if (part > parts) part = 1;
-  const shown = all.slice((part - 1) * PER_PART, part * PER_PART);
+  const shown = matching.slice((part - 1) * PER_PART, part * PER_PART);
 
-  // The board's order: what's stored (each a row: tap it to replace or remove it), then Add a secret.
   const sections = [];
   if (!keyed) sections.push({ id: 'key', blocks: [{ type: 'callout', tone: 'bad', title: 'No age key',
     text: `There is no age key at ${c.key}, so nothing can be stored. Run: loom secrets init` }] });
-  // Each agent's requests and what it gets without asking are on its own Secrets tab; waiting ones are in the Inbox.
-  const agents = [...new Set(allRequests(c).map((r) => r.agent).concat(Object.values(readPolicy(c).secrets).flatMap((r) => (r && r.agents) || [])))]
-    .filter((a) => typeof a === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(a)).sort();
-  if (agents.length) sections.push({ id: 'agents', side: true, title: 'Each agent\'s secrets', blocks: [
-    { type: 'text', tone: 'muted', text: 'What each agent gets without asking, and what it has asked for: on its own Secrets tab.' },
-    { type: 'list', items: agents.map((a) => ({ text: named(a), agent: a, page: `agent:${a}` })) }] });
-  sections.push({ id: 'store', blocks: shown.length
-    ? [{ type: 'list', items: shown.map((name) => ({ text: name, page: `secret?name=${encodeURIComponent(name)}` })) }]
-    : [{ type: 'text', tone: 'muted', text: 'Nothing stored yet.' }] });
-  sections.push({ id: 'add', title: 'Add a secret', blocks: [{
-    type: 'form', action: 'add', submit: 'Save',
-    note: 'The value goes straight to the secrets piece and into the encrypted store. It is never shown here again.',
-    fields: [
-      { name: 'name', label: 'Name', kind: 'text', hint: NAME_HINT, required: true },
-      { name: 'value', label: 'Value', kind: 'secret', required: true,
-        hint: 'One line, 64 KB at most. For a multi-line value (a JSON key, an .env), pipe it in: loom secrets add <name>' },
-    ],
-  }] });
+  sections.push(...waitingSection(allRequests(c)));
+  // Add a secret: the page's one primary action, a sheet with the name and the value.
+  sections.push({ id: 'add', blocks: [{ type: 'panel', rows: [{
+    label: 'Add a secret', value: 'Stored encrypted. Its value is never shown again.',
+    edit: { action: 'add', title: 'Add a secret', submit: 'Save',
+      fields: [
+        { name: 'name', label: 'Name', kind: 'text', hint: NAME_HINT, required: true },
+        { name: 'value', label: 'Value', kind: 'secret', required: true,
+          hint: 'It goes straight into the encrypted store and is never shown again. One line, 64 KB at most; for a multi-line value (a JSON key, an .env), pipe it in: loom secrets add <name>' },
+      ] },
+  }] }] });
+  const store = [];
+  if (all.length > 8) store.push({ type: 'filters', param: 'who', search: 'Find a secret', options: WHO_FILTER });
+  store.push(shown.length
+    ? { type: 'panel', rows: shown.map((name) => ({ label: name, value: whoGetsWords(policy, agents, name), detail: usedWords(uses.get(name)), page: secretLink(name) })) }
+    : { type: 'text', tone: 'muted', text: all.length ? 'No secret matches.' : 'Nothing stored yet.' });
+  sections.push({ id: 'store', title: matching.length === all.length ? `In the store · ${all.length}` : `${matching.length} of ${all.length}`, blocks: store });
   if (parts > 1) {
     const options = [];
     for (let p = 1; p <= parts; p++) {
       const from = (p - 1) * PER_PART;
       options.push({ value: p === 1 ? '' : String(p),
-        label: `${all[from]} to ${all[Math.min(from + PER_PART, all.length) - 1]}` });
+        label: `${matching[from]} to ${matching[Math.min(from + PER_PART, matching.length) - 1]}` });
     }
-    sections.push({ id: 'parts', side: true, title: `Showing ${shown.length} of ${all.length}`,
+    sections.push({ id: 'parts', side: true, title: `Showing ${shown.length} of ${matching.length}`,
       blocks: [{ type: 'filters', param: 'part', options }] });
   }
+  // Each agent's requests and what it gets are on its own Secrets tab.
+  if (agents.length) sections.push({ id: 'agents', side: true, title: 'Each agent\'s secrets', blocks: [{ type: 'panel', rows: agents.map((a) => {
+    const gs = all.map((name) => givenTo(policy.secrets[name], a));
+    const start = gs.filter((g) => g.start).length;
+    const auto = gs.filter((g) => g.auto).length;
+    return { label: named(a), agent: a, page: `agent:${a}`,
+      value: start || auto ? [start && `${start} at start`, auto && `${auto} without asking`].filter(Boolean).join(', ') : 'Asks for each one' };
+  }) }] });
   sections.push(policySection(c));
   return {
     title: 'Secrets',
-    intro: `${all.length} stored, ${keyed ? 'key on this host' : 'no key'}. Write-only: bodies get them when they start, or ask for one (you allow or deny it here), and there is no way to read one back on this page.`,
+    intro: `${all.length} stored, ${keyed ? 'key on this host' : 'no key'}. Write-only: houses get them when they start, or ask for one, and there is no way to read one back here.`,
     sections,
   };
 }
 
-/** Who gets this secret without asking (Always allow on a request card), each with Stop. */
-function standingSection(c, name) {
-  const agents = standing(c, name);
-  if (!agents.length) return [];
-  return [{ id: 'standing', title: 'Given without asking', blocks: [{ type: 'list', items: agents.map((agent) => ({
-    text: named(agent), meta: `Every house of ${named(agent)} gets it when it asks`,
-    act: { action: 'stop-always', label: 'Stop', tone: 'danger', fields: { name, agent },
-      confirm: `${named(agent)}'s houses will ask you for ${name} again.` },
-  })) }] }];
-}
-
-/** One stored name: a Replace form and a Remove button. Never a value. */
-function secretPage(c, name) {
+/** One stored name: who gets it (a switch for each way), its grants, Replace and Remove. Never a value. */
+function secretPage(c, name, scope = '') {
   if (!NAME.test(name) || !names(c).includes(name)) return NOT_FOUND;
-  return {
-    title: name,
-    intro: 'Write-only: its value is never shown, here or anywhere on this page.',
-    sections: [...standingSection(c, name), { id: 'secret', blocks: [
-      { type: 'form', title: 'Replace', action: 'replace', submit: 'Replace', hidden: { name },
-        note: 'The old value is overwritten. Bodies pick up the new one the next time they start.',
-        fields: [{ name: 'value', label: 'New value', kind: 'secret', required: true }] },
-      { type: 'buttons', items: [{ action: 'remove', label: 'Remove', tone: 'danger', fields: { name },
-        confirm: `Bodies started after this won't get ${name}.` }] },
-    ] }],
-  };
+  const rule = readPolicy(c).secrets[name];
+  const u = lastUse(c).get(name);
+  const rs = allRequests(c).filter((r) => r.secret === name && (!scope || r.agent === scope));
+  const sections = [...waitingSection(rs)];
+  sections.push({ id: 'secret', blocks: [{ type: 'panel', rows: [
+    scope
+      ? { label: 'Value', value: 'Hidden. It’s never shown, here or anywhere.', detail: 'Replace or remove it on the household’s Secrets page.', page: `household:${secretLink(name)}` }
+      : { label: 'Value', value: 'Hidden. It’s never shown, here or anywhere.', detail: 'Tap to replace it.',
+        edit: { action: 'replace', title: `Replace ${name}`, submit: 'Replace', hidden: { name },
+          fields: [{ name: 'value', label: 'New value', kind: 'secret', required: true,
+            hint: 'The old value is overwritten. Houses pick up the new one the next time they start.' }] } },
+    { label: 'Last used', value: u ? `${named(u.agent)}'s house, ${ago(u.at)}` : 'Not given to a house yet',
+      ...(u ? { detail: u.how === 'issue' ? 'Given when the house started' : 'Read with a grant' } : {}) },
+  ] }] });
+  const agents = scope ? [scope] : knownAgents(c);
+  const rows = rule?.grant === 'never'
+    ? [{ label: 'Every agent', value: 'Never given out', detail: 'The policy file says so; no house gets it, at start or by asking.' }]
+    : agents.flatMap((a) => {
+      const g = givenTo(rule, a);
+      return [
+        { label: 'When a house starts', agent: a, value: g.start ? `${named(a)}'s houses get it` : `${named(a)}'s houses start without it`,
+          toggle: { action: 'houses', on: g.start, fields: { name, agent: a } } },
+        { label: 'When a house asks', agent: a, value: g.auto ? `${named(a)}'s houses get it without asking you, 8 hours at a time` : 'It asks you first',
+          toggle: { action: 'auto', on: g.auto, fields: { name, agent: a } } },
+      ];
+    });
+  if (rows.length) sections.push({ id: 'who', title: 'Who gets it', blocks: [{ type: 'panel', rows }] });
+  sections.push(...liveSection(rs), ...pastSection(rs, { withSecret: false }));
+  if (!scope) sections.push({ id: 'more', blocks: [{ type: 'panel', rows: [
+    { label: 'The record', value: 'Its rule and request ids', sheet: { title: name, blocks: [
+      { type: 'code', label: 'Its rule in policy.json', text: JSON.stringify(rule ?? {}, null, 2) },
+      ...(rs.length ? [{ type: 'code', label: 'Its requests: id, agent, house, state', text: rs.slice(0, 40).map((r) => `${r.id}  ${r.agent}  ${r.house}  ${r.state}`).join('\n') }] : []),
+    ] } },
+    { label: 'Remove', value: `Houses started after this won't get ${name}.`,
+      act: { action: 'remove', label: 'Remove', tone: 'danger', fields: { name }, confirm: `Bodies started after this won't get ${name}.` } },
+  ] }] });
+  return { title: name, intro: 'Write-only: its value is never shown.', sections };
 }
 
 const MESSAGES = {
@@ -439,7 +571,7 @@ function uiAct(c, env, req) {
   if (scope) {
     const f = req.fields && typeof req.fields === 'object' ? req.fields : {};
     const theirs = Object.hasOwn(ANSWERS, action) ? allRequests(c).find((r) => r.id === f.id)?.agent === scope
-      : action === 'stop-always' ? f.agent === scope : false;
+      : action === 'stop-always' || action === 'houses' || action === 'auto' ? f.agent === scope : false;
     if (!theirs) return no(`This is ${scope}'s page.`);
   }
   if (Object.hasOwn(ANSWERS, action)) {
@@ -460,6 +592,20 @@ function uiAct(c, env, req) {
       stopAlways(c, name, agent, whoOf(req));
       return { ok: true, message: `${named(agent)}'s houses will ask for ${name} again.`, page: '' };
     } catch (err) { return no(err.message); }
+  }
+  if (action === 'houses' || action === 'auto') {
+    // A panel's switch (loom docs/extensions.md, Panels): on is "on" or "", and it applies at once.
+    const { name, agent, on } = req.fields && typeof req.fields === 'object' ? req.fields : {};
+    if (typeof name !== 'string' || !NAME.test(name) || typeof agent !== 'string' || !/^[a-z][a-z0-9-]{0,39}$/.test(agent)) return no('That is not a secret and an agent.');
+    if (!names(c).includes(name)) return no(`There is no secret named ${name}.`);
+    const yes = on === 'on';
+    try {
+      if (action === 'houses') setHouses(c, name, agent, yes, whoOf(req));
+      else setAlways(c, name, agent, yes, whoOf(req));
+    } catch (err) { return no(err.message); }
+    return { ok: true, page: '', message: action === 'houses'
+      ? (yes ? `${named(agent)}'s houses get ${name} when they start.` : `${named(agent)}'s houses start without ${name}.`)
+      : (yes ? `${named(agent)}'s houses get ${name} without asking you, 8 hours at a time.` : `${named(agent)}'s houses will ask for ${name} again.`) };
   }
   if (!Object.hasOwn(MESSAGES, action)) return no('The secrets piece has no such action.');
   const fields = req.fields && typeof req.fields === 'object' ? req.fields : {};
