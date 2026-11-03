@@ -156,6 +156,23 @@ house:  piece-call secrets get onterris-gh        (works once granted, for that 
   clock waiting on it.
 - **The owner can revoke** a live grant from the page's Requests.
 
+## A house's secrets at start: `may` and `issue`
+
+The runtime says *where* a secret lands in a house (its mapping of the name a house sees to a store name). This
+piece decides *whether* an agent may have it (loom docs/specs/agent-runtime.md, section 6, Secrets):
+
+- `loom secrets may <agent> <name> [--json]` answers `allowed` (the secret's rule lists the agent in `houses`),
+  `denied` (the rule is `never`) or `ask` (anything else: a house asks at run time, as a request above). It never
+  prints a value, and it exits 0 only for allowed.
+- `loom-secrets issue <name> --agent <agent> [--house <id>]` prints the value for a house the runtime is starting,
+  only when `may` says allowed, and only from the runtime's own process (loom names it: `LOOM_PIECE_NAME=runtime`).
+  It's recorded in `audit.jsonl` (`event: issue`), never with the value. The runtime no longer reads secrets with
+  `LOOM_SECRETS_ALLOW_GET=1`: that flag still opens `get --reveal` and `podman` for other host-side tools, and
+  opens nothing for `issue`.
+- `loom secrets policy houses <name> <agent> [--off]` is the owner's: that agent's houses get it at start, or stop.
+  `loom runtime secrets-map --json | loom secrets policy houses-import` moves the runtime's old map of which agent
+  gets which secret into this policy, so nothing a house got before stops reaching it.
+
 ## In loom's bundle
 
 `loom export` and `loom restore` (loom's `docs/specs/household.md`, "Export

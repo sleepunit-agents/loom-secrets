@@ -777,3 +777,50 @@ test('requests: a grant row says its state in words and its time in the box\'s 1
   assert.equal(meta('h-83'), 'Waiting on you \u00b7 \u201cask from h-83\u201d');
   for (const i of items) assert.doesNotMatch(i.meta, /UTC|\d{4}-\d{2}-\d{2}|^h-\d/);
 });
+
+// agent-runtime.md, section 6, Secrets: the runtime says where a secret lands in a house; the policy here decides
+// whether an agent may have it (`may`), and the runtime reads it for a house it's starting (`issue`), with no
+// environment flag that unlocks reading.
+test('may: allowed for an agent its houses list, denied by never, else ask; never a value', { skip }, () => {
+  cli(['init']);
+  cli(['add', 'house-token'], { input: 'hv-1' });
+  assert.equal(cli(['may', 'art', 'house-token']).stdout.trim().split(':')[0], 'ask');
+  assert.equal(cli(['may', 'art', 'house-token']).status, 1);
+  assert.equal(cli(['policy', 'houses', 'house-token', 'art']).status, 0);
+  const yes = cli(['may', 'art', 'house-token', '--json']);
+  assert.equal(yes.status, 0);
+  assert.deepEqual(JSON.parse(yes.stdout), { may: 'allowed' });
+  assert.equal(JSON.parse(cli(['may', 'mark', 'house-token', '--json']).stdout).may, 'ask');
+  assert.doesNotMatch(yes.stdout + yes.stderr, /hv-1/);
+});
+
+test('issue: only the runtime\'s own process, only when may says allowed; LOOM_SECRETS_ALLOW_GET unlocks nothing', { skip }, () => {
+  cli(['init']);
+  cli(['add', 'issue-me'], { input: 'iv-1' });
+  cli(['policy', 'houses', 'issue-me', 'art']);
+  const rt = { LOOM_PIECE_NAME: 'runtime' };
+  const ok = cli(['issue', 'issue-me', '--agent', 'art', '--house', 'h-9'], { extraEnv: rt });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(ok.stdout, 'iv-1');
+  // Not the runtime: refused, whatever the flag says.
+  const body = cli(['issue', 'issue-me', '--agent', 'art'], { extraEnv: { LOOM_SECRETS_ALLOW_GET: '1' } });
+  assert.equal(body.status, 4);
+  assert.equal(body.stdout, '');
+  // Another agent, or a secret the policy doesn't give its houses: refused.
+  assert.equal(cli(['issue', 'issue-me', '--agent', 'mark'], { extraEnv: rt }).status, 4);
+  cli(['policy', 'houses', 'issue-me', 'art', '--off']);
+  assert.equal(cli(['issue', 'issue-me', '--agent', 'art'], { extraEnv: rt }).status, 4);
+  // The record says it was issued, never the value.
+  const log = readFileSync(join(env.LOOM_SECRETS_DIR, 'audit.jsonl'), 'utf-8');
+  assert.match(log, /"event":"issue","secret":"issue-me","agent":"art","house":"h-9","by":"runtime"/);
+  assert.doesNotMatch(log, /iv-1/);
+});
+
+test('policy houses-import takes the runtime\'s old map; the policy is never another piece\'s or a house\'s to change', { skip }, () => {
+  cli(['init']);
+  assert.equal(cli(['policy', 'houses-import'], { input: JSON.stringify({ art: ['a-tok', 'b-tok'], mark: ['a-tok'] }) }).status, 0);
+  assert.equal(JSON.parse(cli(['may', 'mark', 'a-tok', '--json']).stdout).may, 'allowed');
+  assert.equal(JSON.parse(cli(['may', 'mark', 'b-tok', '--json']).stdout).may, 'ask');
+  assert.equal(cli(['policy', 'houses', 'a-tok', 'mark'], { extraEnv: { LOOM_PIECE_NAME: 'runtime' } }).status, 4);
+  assert.equal(cli(['policy', 'houses', 'a-tok', 'mark'], { extraEnv: { HOUSE_ID: 'h-1' } }).status, 4);
+});

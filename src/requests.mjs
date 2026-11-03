@@ -8,7 +8,8 @@
 // grant is one house's and ends with it: the house token is revoked when the
 // house is over, and every grant has its own expiry too.
 //
-//   policy.json   {"v":1,"default":"ask","secrets":{"NAME":{"grant":"auto"|"ask"|"never","agents":["art"],"minutes":60}}}
+//   policy.json   {"v":1,"default":"ask","secrets":{"NAME":{"grant":"auto"|"ask"|"never","agents":["art"],"minutes":60,
+//                  "houses":["art"]}}}   houses: the agents whose houses get it when they start (may, issue)
 //   requests.json every request: pending, granted, denied, revoked (no values)
 //   audit.jsonl   one line a request, decision and read
 //
@@ -270,4 +271,43 @@ export function answer(c, id, action, who) {
     audit(c, { event: action, id, secret: r.secret, agent: r.agent, house: r.house, by: 'owner', ...(who ? { who } : {}) });
     return view(r);
   });
+}
+
+// ---------------------------------------------------------------- may: whether an agent's houses get a secret
+
+const AGENT = /^[a-z][a-z0-9-]{0,39}$/;
+
+/**
+ * `may <agent> <name>` (loom docs/specs/agent-runtime.md, section 6, Secrets): the runtime says where a secret lands
+ * in a house; this policy says whether that agent may have it. allowed: the rule's `houses` names the agent;
+ * denied: the rule is never; ask: anything else (a house asks for it at run time, as a request).
+ */
+export function may(c, agent, secret) {
+  if (!AGENT.test(agent ?? '')) throw new RequestError('that isn\'t an agent\'s name');
+  const rule = readPolicy(c).secrets[secret];
+  if (rule?.grant === 'never') return { may: 'denied', why: `the policy never gives ${secret} out` };
+  if (Array.isArray(rule?.houses) && rule.houses.includes(agent)) return { may: 'allowed' };
+  return { may: 'ask', why: `${secret} isn't given to ${agent}'s houses at start: the owner allows it (loom secrets policy houses ${secret} ${agent})` };
+}
+
+/** The owner lets an agent's houses have a secret when they start (on), or stops it (off). */
+export function setHouses(c, secret, agent, on, who) {
+  if (!AGENT.test(agent ?? '')) throw new RequestError('that isn\'t an agent\'s name');
+  return locked(c, () => {
+    writePolicy(c, (secrets) => {
+      const rule = secrets[secret] && typeof secrets[secret] === 'object' ? secrets[secret] : {};
+      if (on && rule.grant === 'never') throw new RequestError(`the policy never gives ${secret} out`, 409);
+      const hs = new Set(Array.isArray(rule.houses) ? rule.houses : []);
+      if (on) hs.add(agent); else hs.delete(agent);
+      const next = { ...rule };
+      if (hs.size) next.houses = [...hs].sort(); else delete next.houses;
+      secrets[secret] = next;
+    });
+    audit(c, { event: on ? 'houses-allow' : 'houses-stop', secret, agent, by: 'owner', ...(who ? { who } : {}) });
+  });
+}
+
+/** An issue to a house at start, as the runtime asked: recorded, never the value. */
+export function auditIssue(c, agent, secret, house) {
+  audit(c, { event: 'issue', secret, agent, ...(house ? { house } : {}), by: 'runtime' });
 }
