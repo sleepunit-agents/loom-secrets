@@ -147,7 +147,8 @@ const page = (path = '', query = {}) => ui(['page'], { path, query });
 const act = (action, fields, path = '') => ui(['act'], { action, path, fields });
 const blocksOf = (p, id) => p.sections.find((s) => s.id === id)?.blocks ?? [];
 const storeNames = (p) => p.sections.filter((s) => s.id === 'store')
-  .flatMap((s) => s.blocks).filter((b) => b.type === 'list').flatMap((b) => b.items.map((i) => i.text));
+  .flatMap((s) => s.blocks).filter((b) => b.type === 'panel').flatMap((b) => b.rows.map((r) => r.label));
+const rowsOf = (p, id) => blocksOf(p, id).filter((b) => b.type === 'panel').flatMap((b) => b.rows);
 
 before(() => {
   if (skip) return;
@@ -175,13 +176,14 @@ test('ui --json is a v2 manifest: a Secrets tab, a count tile with the key state
   assert.equal(nokey.tile.tone, 'bad');
 });
 
-test('ui page "": an intro, what\'s stored first, then the Add form (text name, secret value)', { skip }, () => {
+test('ui page "": an intro, Add a secret (a row whose sheet takes a text name and a secret value), then the store', { skip }, () => {
   const p = page();
   assert.equal(p.title, 'Secrets');
   assert.match(p.intro, /no way to read one back/);
-  assert.deepEqual(p.sections.map((s) => s.id), ['store', 'add', 'policy']);
-  assert.equal(p.sections[1].title, 'Add a secret');
-  const form = blocksOf(p, 'add').find((b) => b.type === 'form');
+  assert.deepEqual(p.sections.map((s) => s.id), ['add', 'store', 'policy']);
+  const [addRow] = rowsOf(p, 'add');
+  assert.equal(addRow.label, 'Add a secret');
+  const form = addRow.edit;
   assert.equal(form.action, 'add');
   const [name, value] = form.fields;
   assert.equal(name.name, 'name');
@@ -213,21 +215,25 @@ test('ui act add stores the value from stdin JSON; the message names it, never t
 test('ui page lists names only, each a row to its own page: a Replace form and a Remove that asks first', { skip }, () => {
   const p = page();
   assert.deepEqual(storeNames(p), ['b.second', 'example-token']);
-  assert.deepEqual(blocksOf(p, 'store')[0].items[1], { text: 'example-token', page: 'secret?name=example-token' });
+  const row = rowsOf(p, 'store')[1];
+  assert.deepEqual([row.label, row.value, row.detail, row.page], ['example-token', 'Asks you first', 'Not given to a house yet', 'secret?name=example-token']);
   const one = page('secret', { name: 'example-token' });
   assert.equal(one.title, 'example-token');
-  const [form, buttons] = one.sections[0].blocks;
-  assert.equal(form.type, 'form');
+  const value = rowsOf(one, 'secret')[0];
+  assert.equal(value.label, 'Value');
+  assert.match(value.value, /^Hidden/);
+  const form = value.edit;
   assert.equal(form.action, 'replace');
   assert.deepEqual(form.hidden, { name: 'example-token' });
   assert.deepEqual(form.fields.map((f) => [f.name, f.kind, 'value' in f]), [['value', 'secret', false]]);
-  assert.deepEqual(buttons.items.map((b) => [b.action, b.label, b.tone, b.fields.name, typeof b.confirm]), [['remove', 'Remove', 'danger', 'example-token', 'string']]);
+  const remove = rowsOf(one, 'more').find((r) => r.label === 'Remove').act;
+  assert.deepEqual([remove.action, remove.label, remove.tone, remove.fields.name, typeof remove.confirm], ['remove', 'Remove', 'danger', 'example-token', 'string']);
   assert.deepEqual(page('secret', { name: 'not-there' }), { title: 'Not found', sections: [] });
   assert.deepEqual(page('secret', { name: '../x' }), { title: 'Not found', sections: [] });
   assert.deepEqual(page('secret/example-token'), { title: 'Not found', sections: [] });
   // Names with capitals (loom's page paths are lowercase) ride in the query.
   assert.equal(act('add', { name: 'Upper.CASE', value: 'v-up' }).ok, true);
-  assert.equal(blocksOf(page(), 'store')[0].items.find((i) => i.text === 'Upper.CASE').page, 'secret?name=Upper.CASE');
+  assert.equal(rowsOf(page(), 'store').find((r) => r.label === 'Upper.CASE').page, 'secret?name=Upper.CASE');
   assert.equal(page('secret', { name: 'Upper.CASE' }).title, 'Upper.CASE');
   assert.equal(act('remove', { name: 'Upper.CASE' }).ok, true);
 });
@@ -546,6 +552,7 @@ test('requests: ask by default, the owner allows on the page, and only that hous
   assert.equal(m.asks.length, 1);
   const ask = m.asks[0];
   assert.equal(ask.text, 'Art asks for onterris-gh');
+  assert.equal(ask.page, 'secret?name=onterris-gh', "the card opens the secret's own page");
   // No house id leads it: how long, and the house's reason as written.
   assert.match(ask.meta, /^For \d+ min: \u201cpush the fix for onterris\/pond#212 b now \/b\u201d$/);
   assert.match(ask.actions[1].confirm, /^Every house of Art gets onterris-gh without asking, 8 hours at a time,/);
@@ -569,16 +576,17 @@ test('requests: ask by default, the owner allows on the page, and only that hous
   // The page never carries the value; the owner can revoke.
   const page = cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: 'art' } }).stdout;
   assert.ok(!page.includes('ghp_ONTERRIS_VALUE'));
-  const live = JSON.parse(page).sections.find((s) => s.id === 'requests').blocks[0].items[0];
-  // A live grant: its state in words and when it runs out, in the box's 12-hour local time; no house id, no UTC.
-  assert.equal(live.text, 'Art · onterris-gh');
-  assert.match(live.meta, /^Granted until \d{1,2}:\d{2} [AP]M( \u00b7 |$)/);
-  assert.doesNotMatch(live.meta, /h-7|UTC/);
+  const live = JSON.parse(page).sections.find((s) => s.id === 'grants').blocks[0].rows[0];
+  // A live grant: a row saying when it runs out, in the box's 12-hour local time; no house id, no UTC; the house's reason whole.
+  assert.equal(live.label, "Art's house \u00b7 onterris-gh");
+  assert.match(live.value, /^Can read it until \d{1,2}:\d{2} [AP]M$/);
+  assert.equal(live.detail, '\u201cpush the fix for onterris/pond#212 b now /b\u201d');
+  assert.doesNotMatch(`${live.label} ${live.value}`, /h-7|UTC/);
   assert.equal(live.act.confirm, "That house won't be able to read onterris-gh again.");
   // The household's page doesn't list them: it links each agent's tab.
   const home = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }) }).stdout);
   assert.equal(home.sections.find((s) => s.id === 'requests'), undefined);
-  assert.deepEqual(home.sections.find((s) => s.id === 'agents').blocks[1].items.map((i) => [i.text, i.agent, i.page]), [['Art', 'art', 'agent:art']]);
+  assert.deepEqual(home.sections.find((s) => s.id === 'agents').blocks[0].rows.map((r) => [r.label, r.agent, r.page]), [['Art', 'art', 'agent:art']]);
   // From mark's tab, art's request is not mark's to revoke.
   const other = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'revoke', fields: live.act.fields }), extraEnv: { LOOM_SCOPE: 'mark' } }).stdout);
   assert.equal(other.ok, false);
@@ -644,25 +652,35 @@ test('requests: Always allow grants this one and every later house of that agent
   assert.match(hist.outcome, /from now on without asking/);
   // The secret's page says who has it without asking, and the owner can stop it there.
   const page = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: 'secret', query: { name: 'onterris-always' } }) }).stdout);
-  const standing = page.sections.find((s) => s.id === 'standing');
-  const row = standing.blocks[0].items.find((i) => i.text === 'Art');
-  assert.equal(row.meta, 'Every house of Art gets it when it asks');
-  assert.equal(row.act.action, 'stop-always');
-  assert.deepEqual(row.act.fields, { name: 'onterris-always', agent: 'art' }, 'the agent id itself is unchanged');
-  assert.equal(row.act.confirm, "Art's houses will ask you for onterris-always again.");
-  const stop = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'stop-always', fields: row.act.fields }) }).stdout);
+  const who = page.sections.find((s) => s.id === 'who').blocks[0].rows;
+  const row = who.find((r) => r.agent === 'art' && r.label === 'When a house asks');
+  assert.equal(row.value, "Art's houses get it without asking you, 8 hours at a time");
+  assert.deepEqual(row.toggle, { action: 'auto', on: true, fields: { name: 'onterris-always', agent: 'art' } }, 'the agent id itself is unchanged');
+  assert.deepEqual(who.find((r) => r.agent === 'art' && r.label === 'When a house starts').toggle.on, false);
+  // The switch turned off: the panel posts its action with on = "".
+  const stop = JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'auto', fields: { ...row.toggle.fields, on: '' } }) }).stdout);
   assert.equal(stop.ok, true, stop.message);
   assert.equal(stop.message, "Art's houses will ask for onterris-always again.");
   assert.match(api(house('h-33'), ['request', 'onterris-always', '--why', 'again']).body.stdout, /asked the owner/);
   assert.deepEqual(JSON.parse(readFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), 'utf-8')).secrets['onterris-always'],
     { grant: 'ask', minutes: 480 }, 'Stop leaves the length as Always set it');
-  // Art's Secrets tab says what it gets without asking, with the same Stop; mark's says nothing of art's.
+  // Art's Secrets tab says what it gets, each a row to the secret's page (its switches); mark's says nothing of art's.
   const tab = (agent) => JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: agent } }).stdout);
   cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'always', fields: (api(house('h-39'), ['request', 'onterris-always', '--why', 'x']),
     JSON.parse(cli(['ui', '--json']).stdout).asks.find((a) => a.text.includes('onterris-always')).actions[1].fields) }) });
-  assert.deepEqual(tab('art').sections.find((s) => s.id === 'gets').blocks[0].items.map((i) => [i.text, i.act?.action]), [['onterris-always', 'stop-always']]);
-  assert.equal(tab('art').sections.find((s) => s.id === 'gets').blocks[0].items[0].act.confirm, "Art's houses will ask you for onterris-always again.");
-  assert.match(tab('art').intro, /^What Art's houses get without asking/);
+  assert.deepEqual(tab('art').sections.find((s) => s.id === 'gets').blocks[0].rows.map((r) => [r.label, r.value, r.page]),
+    [['onterris-always', 'When a house asks, without you', 'secret?name=onterris-always']]);
+  assert.match(tab('art').intro, /^What Art's houses get/);
+  // On an agent's tab, the secret's page holds only that agent's switches, and its value row leads to the household's page.
+  const scoped = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: 'secret', query: { name: 'onterris-always' } }), extraEnv: { LOOM_SCOPE: 'art' } }).stdout);
+  assert.deepEqual([...new Set(scoped.sections.find((s) => s.id === 'who').blocks[0].rows.map((r) => r.agent))], ['art']);
+  assert.equal(scoped.sections.find((s) => s.id === 'secret').blocks[0].rows[0].page, 'household:secret?name=onterris-always');
+  assert.equal(scoped.sections.find((s) => s.id === 'more'), undefined, 'no Remove on an agent\'s tab');
+  // Mark's tab can't flip art's switches; art's can.
+  for (const action of ['auto', 'houses']) {
+    assert.equal(JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action, fields: { name: 'onterris-always', agent: 'art', on: '' } }),
+      extraEnv: { LOOM_SCOPE: 'mark' } }).stdout).ok, false, `mark's tab can't flip art's ${action}`);
+  }
   assert.equal(tab('mark').sections.find((s) => s.id === 'gets').blocks[0].text, "Nothing: Mark's houses ask you for every secret they don't start with.");
   assert.equal(tab('mark').sections.find((s) => s.id === 'gets').blocks[0].type, 'text');
   assert.equal(JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'stop-always', fields: { name: 'onterris-always', agent: 'art' } }),
@@ -722,7 +740,7 @@ test('requests: the owner\'s yes outlives the house that asked, once; the clock 
   assert.match(api(house('h-61'), ['request', 'no-carry', '--why', 'y']).body.stdout, /asked the owner/);
   // Revoking the original ends the carried one too.
   const live1 = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: 'art' } }).stdout)
-    .sections.find((s) => s.id === 'requests').blocks[0].items.find((i) => i.text.includes('carry-me') && i.act && i.meta.includes('\u201cpond work\u201d'));
+    .sections.find((s) => s.id === 'grants').blocks[0].rows.find((r) => r.label.includes('carry-me') && r.act && r.detail === '\u201cpond work\u201d');
   if (live1) {
     cli(['ui', 'act', '--json'], { input: JSON.stringify({ action: 'revoke', fields: live1.act.fields }) });
     assert.equal(api(house('h-51'), ['get', 'carry-me']).status, 403);
@@ -767,15 +785,21 @@ test('requests: a grant row says its state in words and its time in the box\'s 1
   Object.assign(of('h-81'), { state: 'granted', by: 'owner', decided: of('h-81').at, expires: nextYear.toISOString() });
   Object.assign(of('h-82'), { state: 'granted', by: 'owner', decided: of('h-82').at, expires: new Date(Date.now() - 60_000).toISOString() });
   writeFileSync(file, JSON.stringify(d));
-  const items = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: 'art' } }).stdout)
-    .sections.find((s) => s.id === 'requests').blocks[0].items.filter((i) => i.text === 'Art · when-ends');
-  const meta = (h) => items.find((i) => i.meta.includes(`ask from ${h}`)).meta;
+  const tab = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '' }), extraEnv: { LOOM_SCOPE: 'art' } }).stdout);
+  const sec = (id) => tab.sections.find((s) => s.id === id);
+  const live = (h) => sec('grants').blocks[0].rows.find((r) => r.detail === `\u201cask from ${h}\u201d`);
   const month = later.toLocaleDateString('en-US', { month: 'short' });
-  assert.equal(meta('h-80'), `Granted until ${month} ${later.getDate()}, 3:05 PM \u00b7 \u201cask from h-80\u201d`);
-  assert.equal(meta('h-81'), `Granted until Jan 2, ${nextYear.getFullYear()}, 9:07 AM \u00b7 \u201cask from h-81\u201d`);
-  assert.equal(meta('h-82'), 'Expired \u00b7 \u201cask from h-82\u201d');
-  assert.equal(meta('h-83'), 'Waiting on you \u00b7 \u201cask from h-83\u201d');
-  for (const i of items) assert.doesNotMatch(i.meta, /UTC|\d{4}-\d{2}-\d{2}|^h-\d/);
+  assert.equal(live('h-80').value, `Can read it until ${month} ${later.getDate()}, 3:05 PM`);
+  assert.equal(live('h-81').value, `Can read it until Jan 2, ${nextYear.getFullYear()}, 9:07 AM`);
+  // Waiting: a row whose sheet holds the three answers; the past: a wrapped list, each reason whole.
+  const waiting = sec('waiting').blocks[0].rows.find((r) => r.value === '\u201cask from h-83\u201d');
+  assert.equal(waiting.label, 'Art asks for when-ends');
+  assert.match(waiting.detail, /^For \d+ min \u00b7 asked just now$/);
+  assert.deepEqual(waiting.sheet.blocks.find((b) => b.type === 'buttons').items.map((i) => i.action), ['grant', 'always', 'deny']);
+  const past = sec('requests').blocks[0];
+  assert.equal(past.wrap, true);
+  assert.equal(past.items.find((i) => i.meta.endsWith('\u201cask from h-82\u201d')).meta, 'Expired \u00b7 just now \u00b7 \u201cask from h-82\u201d');
+  for (const r of sec('grants').blocks[0].rows) assert.doesNotMatch(`${r.label} ${r.value}`, /UTC|\d{4}-\d{2}-\d{2}|h-\d/);
 });
 
 // agent-runtime.md, section 6, Secrets: the runtime says where a secret lands in a house; the policy here decides
@@ -823,4 +847,33 @@ test('policy houses-import takes the runtime\'s old map; the policy is never ano
   assert.equal(JSON.parse(cli(['may', 'mark', 'b-tok', '--json']).stdout).may, 'ask');
   assert.equal(cli(['policy', 'houses', 'a-tok', 'mark'], { extraEnv: { LOOM_PIECE_NAME: 'runtime' } }).status, 4);
   assert.equal(cli(['policy', 'houses', 'a-tok', 'mark'], { extraEnv: { HOUSE_ID: 'h-1' } }).status, 4);
+});
+
+test('the secret page\'s switches: houses (at start) and auto (when asked) apply at once; the store says who gets it and when last used', { skip }, () => {
+  cli(['add', 'switch-me'], { input: 'S' });
+  const act = (action, fields) => JSON.parse(cli(['ui', 'act', '--json'], { input: JSON.stringify({ action, fields }) }).stdout);
+  const on = act('houses', { name: 'switch-me', agent: 'mark', on: 'on' });
+  assert.deepEqual(on, { ok: true, page: '', message: "Mark's houses get switch-me when they start." });
+  assert.equal(cli(['may', 'mark', 'switch-me']).status, 0, 'may says allowed once the switch is on');
+  assert.equal(act('auto', { name: 'switch-me', agent: 'mark', on: 'on' }).ok, true);
+  const rule = JSON.parse(readFileSync(join(env.LOOM_SECRETS_DIR, 'policy.json'), 'utf-8')).secrets['switch-me'];
+  assert.deepEqual(rule, { grant: 'auto', agents: ['mark'], minutes: 480, houses: ['mark'] });
+  const page = () => JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '', query: {} }) }).stdout);
+  const row = () => page().sections.find((s) => s.id === 'store').blocks.find((b) => b.type === 'panel').rows.find((r) => r.label === 'switch-me');
+  assert.equal(row().value, 'Mark at start and when asked');
+  assert.equal(row().detail, 'Not given to a house yet');
+  // The runtime hands it to a house it starts: the store row says so, in words.
+  assert.equal(cli(['issue', 'switch-me', '--agent', 'mark', '--house', 'h-90'], { extraEnv: { LOOM_PIECE_NAME: 'runtime' } }).status, 0);
+  assert.equal(row().detail, "Last given to Mark's house just now");
+  // The filter: at start finds it, never doesn't.
+  const filtered = (who) => JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: '', query: { who } }) }).stdout)
+    .sections.find((s) => s.id === 'store').blocks.flatMap((b) => b.rows ?? []).map((r) => r.label);
+  assert.ok(filtered('start').includes('switch-me'));
+  assert.ok(!filtered('never').includes('switch-me'));
+  // Off again, both; a bad agent or a missing secret is refused.
+  assert.equal(act('houses', { name: 'switch-me', agent: 'mark', on: '' }).message, "Mark's houses start without switch-me.");
+  assert.equal(act('auto', { name: 'switch-me', agent: 'mark', on: '' }).message, "Mark's houses will ask for switch-me again.");
+  assert.equal(row().value, 'Asks you first');
+  assert.equal(act('houses', { name: 'switch-me', agent: 'Mark!', on: 'on' }).ok, false);
+  assert.equal(act('auto', { name: 'not-stored', agent: 'mark', on: 'on' }).ok, false);
 });

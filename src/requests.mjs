@@ -230,6 +230,16 @@ export function stopAlways(c, secret, agent, who) {
   });
 }
 
+/** The owner gives an agent's houses a secret when they ask, without asking them (the page's toggle), or stops it. */
+export function setAlways(c, secret, agent, on, who) {
+  if (!AGENT.test(agent ?? '')) throw new RequestError('that isn\'t an agent\'s name');
+  return locked(c, () => {
+    if (!on && !standing(c, secret).includes(agent)) return;
+    setAuto(c, secret, agent, on);
+    audit(c, { event: on ? 'always-on' : 'stop-always', secret, agent, by: 'owner', ...(who ? { who } : {}) });
+  });
+}
+
 /** The owner answers a request (the page): grant, always (grant, and auto from now on), deny, or revoke a live grant. */
 /** who: the member who answered (loom's caller, docs/specs/owners.md in loom); kept beside by: 'owner'. */
 export function answer(c, id, action, who) {
