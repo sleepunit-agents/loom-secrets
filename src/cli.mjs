@@ -26,7 +26,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError, standing, stopAlways, forgetStanding, stateOf } from './requests.mjs';
+import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError, standing, stopAlways, forgetStanding, stateOf, may, setHouses, auditIssue } from './requests.mjs';
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const STORE = 'store.sops.json';
@@ -43,6 +43,16 @@ const USAGE = `Usage: loom secrets <command> [args]
   get <name> --reveal           Print a value: only at a terminal, or with
                                 LOOM_SECRETS_ALLOW_GET=1 set by the host side
   podman <name> <podman-name>   Put the value into a podman secret, unprinted
+  may <agent> <name> [--json]   Whether that agent's houses get it when they start:
+                                allowed, denied or ask (the policy's say; never a value)
+  issue <name> --agent A [--house H]
+                                The value, for a house the runtime is starting, when
+                                \`may\` says allowed: only from the runtime's own process
+                                (loom names it: LOOM_PIECE_NAME runtime), no flag to set
+  policy houses <name> <agent> [--off]
+                                The owner's: that agent's houses get it at start (or stop)
+  policy houses-import          The owner's: {"<agent>": ["<name>", ...]} on stdin, each
+                                allowed (the runtime's old map: loom runtime secrets-map --json)
   ui --json                     loom's page: the manifest (tab, Home tile)
   ui page --json                loom's page: one page, from {path, query} on stdin
   ui act --json                 loom's page: add / replace / remove, from
@@ -654,6 +664,64 @@ export async function main(argv, io) {
       const req = await readRequest(io);
       io.stdout(JSON.stringify(await apiAnswer(c, io.env, req)) + '\n');
       return 0;
+    }
+
+    case 'may': {
+      // Anyone at loom's machine may ask; the answer is the policy's, never a value.
+      allow(['--json']);
+      if (pos.length !== 2) throw new Fail('usage: loom secrets may <agent> <name> [--json]', 2);
+      checkName(pos[1]);
+      let r;
+      try { r = may(c, pos[0], pos[1]); } catch (err) { throw new Fail(err.message, 2); }
+      io.stdout(flags.has('--json') ? JSON.stringify(r) + '\n' : `${r.may}${r.why ? `: ${r.why}` : ''}\n`);
+      return r.may === 'allowed' ? 0 : 1;
+    }
+
+    case 'issue': {
+      // A house's secret, to the runtime starting it (agent-runtime.md, section 6): the policy decides (may), and
+      // only the runtime's own process asks. loom names that process (LOOM_PIECE_NAME); nothing here reads a flag
+      // that says "let me read secrets". A guardrail, not a boundary, as the gate always was (README, "Threat model").
+      const args2 = args.filter((a, i) => a !== '--agent' && a !== '--house' && args[i - 1] !== '--agent' && args[i - 1] !== '--house');
+      const agent = args[args.indexOf('--agent') + 1];
+      const house = args.includes('--house') ? args[args.indexOf('--house') + 1] : undefined;
+      if (args2.length !== 1 || !args.includes('--agent') || !agent) throw new Fail('usage: loom secrets issue <name> --agent <agent> [--house <id>]', 2);
+      checkName(args2[0]);
+      if (!['runtime', 'box'].includes(io.env.LOOM_PIECE_NAME ?? '')) {
+        throw new Fail('refused: issue is the runtime\'s, from its own process, for a house it\'s starting. A body gets its secrets that way, or asks (request).', 4);
+      }
+      let r;
+      try { r = may(c, agent, args2[0]); } catch (err) { throw new Fail(err.message, 2); }
+      if (r.may !== 'allowed') throw new Fail(`refused: ${r.may} for ${agent}: ${r.why}`, 4);
+      const data = decrypt(c, io.env);
+      if (!Object.hasOwn(data, args2[0])) throw new Fail(`no secret named ${args2[0]}`, 3);
+      auditIssue(c, agent, args2[0], house);
+      io.stdout(data[args2[0]]);
+      return 0;
+    }
+
+    case 'policy': {
+      // The owner's, at loom's machine: not another piece's process, not a house.
+      if ((io.env.LOOM_PIECE_NAME && io.env.LOOM_PIECE_NAME !== 'secrets') || io.env.HOUSE_ID) throw new Fail('refused: the policy is the owner\'s, at loom\'s machine', 4);
+      if (pos[0] === 'houses' && pos.length === 3) {
+        allow(['--off']);
+        checkName(pos[1]);
+        try { setHouses(c, pos[1], pos[2], !flags.has('--off')); } catch (err) { throw new Fail(err.message, 2); }
+        io.stderr(`${pos[2]}'s houses ${flags.has('--off') ? 'no longer get' : 'get'} ${pos[1]} when they start\n`);
+        return 0;
+      }
+      if (pos[0] === 'houses-import' && pos.length === 1) {
+        allow([]);
+        const m = await readRequest(io);
+        if (!m || typeof m !== 'object' || Array.isArray(m)) throw new Fail('houses-import takes {"<agent>": ["<name>", ...]} on stdin', 2);
+        let n = 0;
+        for (const [agent, list] of Object.entries(m)) {
+          if (!Array.isArray(list)) throw new Fail(`${agent}: a list of secret names`, 2);
+          for (const name of list) { checkName(name); try { setHouses(c, name, agent, true); n++; } catch (err) { throw new Fail(`${agent} ${name}: ${err.message}`, 2); } }
+        }
+        io.stderr(`allowed ${n} secret${n === 1 ? '' : 's'} at house start\n`);
+        return 0;
+      }
+      throw new Fail('usage: loom secrets policy houses <name> <agent> [--off] | policy houses-import < map', 2);
     }
 
     case 'state': {
