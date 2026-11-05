@@ -26,7 +26,7 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, re
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError, standing, stopAlways, forgetStanding, stateOf, may, setHouses, setAlways, auditIssue } from './requests.mjs';
+import { all as allRequests, answer, mayRead, mine, readPolicy, request, RequestError, standing, stopAlways, forgetStanding, stateOf, may, setHouses, setAlways, auditIssue, record } from './requests.mjs';
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const STORE = 'store.sops.json';
@@ -158,10 +158,13 @@ function put(c, env, name, value, mode) {
   checkName(name);
   withLock(c, () => {
     const data = decrypt(c, env);
-    if (mode === 'new' && Object.hasOwn(data, name)) throw new Fail(`${name} already exists (pass --force to replace it)`, 3);
-    if (mode === 'existing' && !Object.hasOwn(data, name)) throw new Fail(`no secret named ${name}`, 3);
+    const had = Object.hasOwn(data, name);
+    if (mode === 'new' && had) throw new Fail(`${name} already exists (pass --force to replace it)`, 3);
+    if (mode === 'existing' && !had) throw new Fail(`no secret named ${name}`, 3);
     data[name] = value;
     encrypt(c, env, data);
+    // When it was set or changed, for its page (the name and when, never the value).
+    record(c, { event: 'set', secret: name, how: had ? 'replace' : 'add' });
   });
 }
 
@@ -172,6 +175,7 @@ function remove(c, env, name) {
     if (!Object.hasOwn(data, name)) throw new Fail(`no secret named ${name}`, 3);
     delete data[name];
     encrypt(c, env, data);
+    record(c, { event: 'removed', secret: name });
   });
   forgetStanding(c, name);
 }
@@ -320,23 +324,54 @@ function ago(iso, now = new Date()) {
   return `on ${when(iso, now).replace(/, \d{1,2}:\d{2} [AP]M$/, '')}`;
 }
 
-/** When each secret was last handed to a house (a house starting, or a read with a grant): from the audit, never a value. */
-function lastUse(c) {
+const USE_EVENTS = ['"issue"', '"read"', '"host-read"', '"set"', '"removed"', '"missing"'];
+
+/**
+ * What the record says of each name, from the audit (names and times, never a value): which agents' houses were
+ * given it and when (a house starting, or a read with a grant), when loom's machine read it (get, podman), when it
+ * was set or changed, and when a house was meant to start with it and it wasn't there. A removal clears a name's past.
+ */
+function usage(c) {
   const out = new Map();
   let text = '';
   try { text = readFileSync(join(c.dir, 'audit.jsonl'), 'utf-8'); } catch { return out; }
+  const of = (name) => { let u = out.get(name); if (!u) out.set(name, u = { agents: new Map(), host: null, set: null, missing: null }); return u; };
   for (const line of text.split('\n')) {
-    if (!line.includes('"issue"') && !line.includes('"read"')) continue;
+    if (!USE_EVENTS.some((k) => line.includes(k))) continue;
     let e;
     try { e = JSON.parse(line); } catch { continue; }
-    if ((e.event !== 'issue' && e.event !== 'read') || typeof e.secret !== 'string' || typeof e.at !== 'string') continue;
-    const prev = out.get(e.secret);
-    if (!prev || e.at > prev.at) out.set(e.secret, { at: e.at, agent: e.agent, how: e.event });
+    if (typeof e?.secret !== 'string' || typeof e.at !== 'string') continue;
+    if (e.event === 'removed') { out.delete(e.secret); continue; }
+    if (e.event === 'set') { const u = of(e.secret); u.set = { at: e.at, how: e.how }; u.missing = null; continue; }
+    if (e.event === 'missing') { if (typeof e.agent === 'string') of(e.secret).missing = { at: e.at, agent: e.agent }; continue; }
+    if (e.event === 'host-read') { const u = of(e.secret); if (!u.host || e.at > u.host.at) u.host = { at: e.at, how: e.how }; continue; }
+    if ((e.event === 'issue' || e.event === 'read') && typeof e.agent === 'string') {
+      const u = of(e.secret);
+      const prev = u.agents.get(e.agent);
+      if (!prev || e.at > prev.at) u.agents.set(e.agent, { at: e.at, how: e.event });
+    }
   }
   return out;
 }
 
-const usedWords = (u) => (u ? `Last given to ${named(u.agent)}'s house ${ago(u.at)}` : 'Not given to a house yet');
+/** The latest a house had it: { at, agent, how } or undefined. */
+function lastHouse(u) {
+  let best;
+  for (const [agent, x] of u?.agents ?? []) if (!best || x.at > best.at) best = { ...x, agent };
+  return best;
+}
+
+/** A list row's last line: the latest a house or loom's machine had it. */
+function usedWords(u) {
+  const h = lastHouse(u);
+  if (u?.host && (!h || u.host.at > h.at)) return `Last read on loom's machine ${ago(u.host.at)}`;
+  return h ? `Last given to ${named(h.agent)}'s house ${ago(h.at)}` : 'Not given to a house yet';
+}
+
+/** Whether anything has had it: a house, or loom's machine. */
+const everUsed = (u) => Boolean(u && (u.agents.size || u.host));
+
+const YEAR_MS = 365 * 86_400_000;
 
 /** The agents the store knows of: in the policy or in a request. */
 function knownAgents(c) {
@@ -430,11 +465,11 @@ function policySection(c) {
 /** An agent's Secrets tab (loom docs/extensions.md, agentTab): what it gets, what's waiting, what's live, what it asked. */
 function agentPage(c, agent) {
   const p = readPolicy(c);
-  const uses = lastUse(c);
+  const uses = usage(c);
   const gets = names(c).map((name) => [name, givenTo(p.secrets[name], agent)]).filter(([, g]) => !g.never && (g.start || g.auto));
   const rs = allRequests(c).filter((r) => r.agent === agent);
   const sections = [...waitingSection(rs), { id: 'gets', title: `What ${named(agent)} gets`, blocks: gets.length
-    ? [{ type: 'panel', rows: gets.map(([name, g]) => ({ label: name, value: givesWords(g), detail: usedWords(uses.get(name)), page: secretLink(name) })) }]
+    ? [{ type: 'panel', rows: gets.map(([name, g]) => ({ label: name, value: givesWords(g), detail: agentUsed(uses.get(name), agent), page: secretLink(name) })) }]
     : [{ type: 'text', tone: 'muted', text: `Nothing: ${named(agent)}'s houses ask you for every secret they don't start with.` }] },
   ...liveSection(rs), ...pastSection(rs, { withSecret: true })];
   if (!rs.length) sections.push({ id: 'requests', title: 'Asked before', blocks: [{ type: 'text', tone: 'muted', text: 'No requests yet.' }] });
@@ -446,30 +481,109 @@ const WHO_FILTER = [
   { value: 'ask', label: 'Asks you' }, { value: 'never', label: 'Never' },
 ];
 
-function uiPage(c, req, env = {}) {
-  if (!req || typeof req.path !== 'string') return NOT_FOUND;
-  const scope = typeof env.LOOM_SCOPE === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(env.LOOM_SCOPE) ? env.LOOM_SCOPE : '';
-  const query = req.query && typeof req.query === 'object' ? req.query : {};
-  if (req.path === 'secret') return secretPage(c, String(query.name ?? ''), scope);
-  if (req.path !== '') return NOT_FOUND;
-  if (scope) return agentPage(c, scope);
+/** One agent's use of a secret, for that agent's tab. */
+const agentUsed = (u, agent) => { const a = u?.agents.get(agent); return a ? `Last given to ${named(agent)}'s house ${ago(a.at)}` : 'Not given to a house yet'; };
+
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+const listLink = (of) => `list?of=${encodeURIComponent(of)}`;
+const MISSING_DAYS = 7;   // a house that was meant to start with a name it couldn't have, this recently
+
+/**
+ * The store in groups, by who can use each secret (one secret can be in more than one): each agent (its houses get
+ * it at start or without asking), loom's machine (read there, on record), only when you say yes (no agent gets it
+ * without asking), never given out. And what needs a look: names a house should get that aren't stored, secrets
+ * nobody has used, and secrets not changed in a year (when the record knows). Names only; never a value.
+ */
+function storeView(c) {
   const policy = readPolicy(c);
   const agents = knownAgents(c);
-  const uses = lastUse(c);
+  const uses = usage(c);
   const all = names(c);
-  const keyed = existsSync(c.key);
-  const who = WHO_FILTER.some((o) => o.value && o.value === query.who) ? query.who : '';
-  const q = typeof query.q === 'string' ? query.q.trim().toLowerCase().slice(0, 64) : '';
-  const matching = all.filter((name) => (!q || name.toLowerCase().includes(q)) && (!who || givenKind(policy, agents, name) === who));
-  const parts = Math.max(1, Math.ceil(matching.length / PER_PART));
-  let part = /^[1-9][0-9]{0,5}$/.test(String(query.part ?? '')) ? Number(query.part) : 1;
-  if (part > parts) part = 1;
-  const shown = matching.slice((part - 1) * PER_PART, part * PER_PART);
+  const stored = new Set(all);
+  const now = Date.now();
+  const never = all.filter((n) => policy.secrets[n]?.grant === 'never');
+  const byAgent = agents.map((a) => [a, all.filter((n) => { const g = givenTo(policy.secrets[n], a); return !g.never && (g.start || g.auto); })]);
+  const someone = new Set(byAgent.flatMap(([, ns]) => ns));
+  const askOnly = all.filter((n) => policy.secrets[n]?.grant !== 'never' && !someone.has(n));
+  const host = all.filter((n) => uses.get(n)?.host);
+  // Not used: no agent gets it without asking, and nothing on record has had it (a house, or loom's machine).
+  const unused = askOnly.filter((n) => !everUsed(uses.get(n)));
+  const old = all.filter((n) => { const set = uses.get(n)?.set; return set && now - Date.parse(set.at) > YEAR_MS; });
+  // Missing: the rules give it to an agent's houses at start or without asking, or a house was just meant to start
+  // with it, and it isn't in the store.
+  const missing = new Map();
+  for (const [n, rule] of Object.entries(policy.secrets)) {
+    if (stored.has(n) || !NAME.test(n) || !rule || typeof rule !== 'object' || rule.grant === 'never') continue;
+    const to = [...new Set([...(Array.isArray(rule.houses) ? rule.houses : []), ...(rule.grant === 'auto' && Array.isArray(rule.agents) ? rule.agents : [])])]
+      .filter((a) => typeof a === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(a));
+    if (to.length) missing.set(n, `The rules give it to ${to.map(named).join(' and ')}'s houses`);
+  }
+  for (const [n, u] of uses) {
+    if (stored.has(n) || missing.has(n) || !NAME.test(n) || !u.missing || now - Date.parse(u.missing.at) > MISSING_DAYS * 86_400_000) continue;
+    missing.set(n, `${named(u.missing.agent)}'s house was meant to start with it ${ago(u.missing.at)}`);
+  }
+  return { policy, agents, uses, all, never, byAgent, askOnly, host, unused, old, missing };
+}
 
+/** An add form for a name the rules want and the store doesn't have. */
+const addMissing = (name) => ({ action: 'add', title: `Add ${name}`, submit: 'Save', hidden: { name },
+  fields: [{ name: 'value', label: 'Value', kind: 'secret', required: true, hint: 'It goes straight into the encrypted store and is never shown again.' }] });
+
+/** The groups a list page can show, by `of`. */
+function groupOf(v, of) {
+  if (of === 'all') return { title: 'All secrets', intro: 'Every secret in the store.', names: v.all };
+  if (of === 'never') return { title: 'Never given out', intro: 'The rules never give these to a house, at start or by asking.', names: v.never };
+  if (of === 'ask') return { title: 'Only when you say yes', intro: 'No agent gets these without asking: a house asks you each time.', names: v.askOnly };
+  if (of === 'loom') return { title: "Loom's machine", intro: "Read on loom's machine itself (a host script, or podman), on record.", names: v.host };
+  if (of === 'unused') return { title: 'Not used by anyone', intro: "No agent gets these without asking, and nothing on record has had them: no house, and not loom's machine. Remove what's done with. Reads on loom's machine itself are on record from this version of the piece on, so a secret only a host script reads leaves this list the next time it's read.", names: v.unused };
+  if (of === 'old') return { title: 'Not changed in a year', intro: 'Set over a year ago, by the record. Worth replacing if they can be rotated.', names: v.old };
+  if (of === 'missing') return { title: 'Not in the store', intro: 'A house is meant to get these, and they are not stored. Add each, or stop giving it out on the policy file.', names: [...v.missing.keys()], missing: true };
+  const m = /^agent:([a-z][a-z0-9-]{0,39})$/.exec(of);
+  const found = m && v.byAgent.find(([a]) => a === m[1]);
+  if (found) return { title: `${named(found[0])}'s secrets`, intro: `What ${named(found[0])}'s houses get: at start, or when they ask without asking you.`, names: found[1], agent: found[0] };
+  return null;
+}
+
+/** A row of the store: its name, who gets it, when it was last used; a tap to its own page. */
+const storeRow = (v, name) => ({ label: name, value: whoGetsWords(v.policy, v.agents, name), detail: usedWords(v.uses.get(name)), page: secretLink(name) });
+
+/** The index: what needs a look first, then the store as groups (a row each, with a count), then Add. */
+function indexPage(c, v) {
+  const keyed = existsSync(c.key);
   const sections = [];
   if (!keyed) sections.push({ id: 'key', blocks: [{ type: 'callout', tone: 'bad', title: 'No age key',
     text: `There is no age key at ${c.key}, so nothing can be stored. Run: loom secrets init` }] });
-  sections.push(...waitingSection(allRequests(c)));
+  const rs = allRequests(c);
+  sections.push(...waitingSection(rs));
+  const look = [];
+  const missing = [...v.missing];
+  if (missing.length && missing.length <= 3) {
+    for (const [name, why] of missing) look.push({ label: name, tone: 'bad', value: 'Not in the store', detail: `${why}. Tap to add it.`, edit: addMissing(name) });
+  } else if (missing.length) {
+    look.push({ label: 'Not in the store', tone: 'bad', value: plural(missing.length, 'secret'), detail: 'A house is meant to get them, and they are not stored', page: listLink('missing') });
+  }
+  if (v.old.length) look.push({ label: 'Not changed in a year', tone: 'warn', value: plural(v.old.length, 'secret'), detail: 'Worth replacing if they can be rotated', page: listLink('old') });
+  if (v.unused.length) look.push({ label: 'Not used by anyone', value: plural(v.unused.length, 'secret'), detail: "No agent gets them, and nothing on record has had them", page: listLink('unused') });
+  sections.push({ id: 'look', title: 'Needs a look', blocks: look.length
+    ? [{ type: 'panel', rows: look }]
+    : [{ type: 'text', tone: 'muted', text: rs.some((r) => r.state === 'pending') ? 'Nothing else.' : 'Nothing: every secret a house is meant to get is stored, and each one is used.' }] });
+  // Who can use them: a row a group, with its count. A secret given to two agents is in both.
+  const groups = v.byAgent.map(([a, ns]) => {
+    const gs = ns.map((n) => givenTo(v.policy.secrets[n], a));
+    const start = gs.filter((g) => g.start).length;
+    const auto = gs.filter((g) => g.auto && !g.start).length;
+    return { label: named(a), agent: a, value: plural(ns.length, 'secret'),
+      detail: ns.length ? [start && `${start} at start`, auto && `${auto} when asked, without you`].filter(Boolean).join(', ') : 'Asks you for each one',
+      page: listLink(`agent:${a}`) };
+  });
+  groups.push({ label: "Loom's machine", value: plural(v.host.length, 'secret'), detail: v.host.length ? 'Read there (a host script, or podman)' : 'None read there on record yet',
+    ...(v.host.length ? { page: listLink('loom') } : {}) });
+  groups.push({ label: 'Only when you say yes', value: plural(v.askOnly.length, 'secret'), detail: 'A house asks you each time', page: listLink('ask') });
+  if (v.never.length) groups.push({ label: 'Never given out', value: plural(v.never.length, 'secret'), detail: 'The rules refuse every house', page: listLink('never') });
+  groups.push({ label: 'All secrets', value: String(v.all.length), detail: 'Find one by name', page: listLink('all') });
+  sections.push({ id: 'groups', title: 'Who can use them', blocks: v.all.length
+    ? [{ type: 'panel', rows: groups }]
+    : [{ type: 'text', tone: 'muted', text: 'Nothing stored yet.' }] });
   // Add a secret: the page's one primary action, a sheet with the name and the value.
   sections.push({ id: 'add', blocks: [{ type: 'panel', rows: [{
     label: 'Add a secret', value: 'Stored encrypted. Its value is never shown again.',
@@ -480,12 +594,34 @@ function uiPage(c, req, env = {}) {
           hint: 'It goes straight into the encrypted store and is never shown again. One line, 64 KB at most; for a multi-line value (a JSON key, an .env), pipe it in: loom secrets add <name>' },
       ] },
   }] }] });
+  sections.push(policySection(c));
+  return {
+    title: 'Secrets',
+    intro: `${v.all.length} stored, ${keyed ? 'key on this host' : 'no key'}. Write-only: houses get them when they start, or ask for one, and there is no way to read one back here.`,
+    sections,
+  };
+}
+
+/** One group's secrets: a row each to its page; the whole store also has the filter and search. Parts past 200. */
+function listPage(c, v, query) {
+  const g = groupOf(v, typeof query.of === 'string' ? query.of : '');
+  if (!g) return NOT_FOUND;
+  const isAll = query.of === 'all';
+  const who = isAll && WHO_FILTER.some((o) => o.value && o.value === query.who) ? query.who : '';
+  const q = isAll && typeof query.q === 'string' ? query.q.trim().toLowerCase().slice(0, 64) : '';
+  const matching = g.names.filter((name) => (!q || name.toLowerCase().includes(q)) && (!who || givenKind(v.policy, v.agents, name) === who));
+  const parts = Math.max(1, Math.ceil(matching.length / PER_PART));
+  let part = /^[1-9][0-9]{0,5}$/.test(String(query.part ?? '')) ? Number(query.part) : 1;
+  if (part > parts) part = 1;
+  const shown = matching.slice((part - 1) * PER_PART, part * PER_PART);
   const store = [];
-  if (all.length > 8) store.push({ type: 'filters', param: 'who', search: 'Find a secret', options: WHO_FILTER });
+  if (isAll && g.names.length > 8) store.push({ type: 'filters', param: 'who', search: 'Find a secret', options: WHO_FILTER });
   store.push(shown.length
-    ? { type: 'panel', rows: shown.map((name) => ({ label: name, value: whoGetsWords(policy, agents, name), detail: usedWords(uses.get(name)), page: secretLink(name) })) }
-    : { type: 'text', tone: 'muted', text: all.length ? 'No secret matches.' : 'Nothing stored yet.' });
-  sections.push({ id: 'store', title: matching.length === all.length ? `In the store · ${all.length}` : `${matching.length} of ${all.length}`, blocks: store });
+    ? { type: 'panel', rows: shown.map((name) => (g.missing
+      ? { label: name, tone: 'bad', value: 'Not in the store', detail: `${v.missing.get(name)}. Tap to add it.`, edit: addMissing(name) }
+      : storeRow(v, name))) }
+    : { type: 'text', tone: 'muted', text: g.names.length ? 'No secret matches.' : 'None.' });
+  const sections = [{ id: 'store', title: matching.length === g.names.length ? `${g.title} · ${g.names.length}` : `${matching.length} of ${g.names.length}`, blocks: store }];
   if (parts > 1) {
     const options = [];
     for (let p = 1; p <= parts; p++) {
@@ -496,27 +632,42 @@ function uiPage(c, req, env = {}) {
     sections.push({ id: 'parts', side: true, title: `Showing ${shown.length} of ${matching.length}`,
       blocks: [{ type: 'filters', param: 'part', options }] });
   }
-  // Each agent's requests and what it gets are on its own Secrets tab.
-  if (agents.length) sections.push({ id: 'agents', side: true, title: 'Each agent\'s secrets', blocks: [{ type: 'panel', rows: agents.map((a) => {
-    const gs = all.map((name) => givenTo(policy.secrets[name], a));
-    const start = gs.filter((g) => g.start).length;
-    const auto = gs.filter((g) => g.auto).length;
-    return { label: named(a), agent: a, page: `agent:${a}`,
-      value: start || auto ? [start && `${start} at start`, auto && `${auto} without asking`].filter(Boolean).join(', ') : 'Asks for each one' };
-  }) }] });
-  sections.push(policySection(c));
-  return {
-    title: 'Secrets',
-    intro: `${all.length} stored, ${keyed ? 'key on this host' : 'no key'}. Write-only: houses get them when they start, or ask for one, and there is no way to read one back here.`,
-    sections,
-  };
+  // An agent's requests and grants are on its own Secrets tab.
+  if (g.agent) sections.push({ id: 'agent', side: true, blocks: [{ type: 'panel', rows: [
+    { label: `${named(g.agent)}'s Secrets tab`, agent: g.agent, value: 'Its requests, live grants and what it asked before', page: `agent:${g.agent}` }] }] });
+  return { title: g.title, intro: `${g.intro} Values are never shown.`, sections };
 }
 
-/** One stored name: who gets it (a switch for each way), its grants, Replace and Remove. Never a value. */
+function uiPage(c, req, env = {}) {
+  if (!req || typeof req.path !== 'string') return NOT_FOUND;
+  const scope = typeof env.LOOM_SCOPE === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(env.LOOM_SCOPE) ? env.LOOM_SCOPE : '';
+  const query = req.query && typeof req.query === 'object' ? req.query : {};
+  if (req.path === 'secret') return secretPage(c, String(query.name ?? ''), scope);
+  // The household's store, in groups, is the household's; an agent's tab is its own (agentPage).
+  if (req.path === 'list') return scope ? NOT_FOUND : listPage(c, storeView(c), query);
+  if (req.path !== '') return NOT_FOUND;
+  if (scope) return agentPage(c, scope);
+  return indexPage(c, storeView(c));
+}
+
+/** Where a secret is used, in words: each agent's houses and loom's machine, latest first. */
+function whereWords(u) {
+  const places = [...(u?.agents ?? [])].map(([agent, x]) => ({ at: x.at, text: `${named(agent)}'s houses, ${ago(x.at)}` }));
+  if (u?.host) places.push({ at: u.host.at, text: `loom's machine, ${ago(u.host.at)}` });
+  places.sort((a, b) => (b.at > a.at ? 1 : -1));
+  return places.map((p, i) => (i ? p.text : p.text.charAt(0).toUpperCase() + p.text.slice(1))).join('; ');
+}
+
+const SET_WORDS = { add: 'Added', replace: 'Changed', restore: 'Restored from a bundle' };
+
+/** One stored name: where it's used, who can read it (a switch for each way), when it was set, its grants, Replace and Remove. Never a value. */
 function secretPage(c, name, scope = '') {
   if (!NAME.test(name) || !names(c).includes(name)) return NOT_FOUND;
-  const rule = readPolicy(c).secrets[name];
-  const u = lastUse(c).get(name);
+  const policy = readPolicy(c);
+  const rule = policy.secrets[name];
+  const u = usage(c).get(name);
+  const latest = lastHouse(u);
+  const hostLast = u?.host && (!latest || u.host.at > latest.at);
   const rs = allRequests(c).filter((r) => r.secret === name && (!scope || r.agent === scope));
   const sections = [...waitingSection(rs)];
   sections.push({ id: 'secret', blocks: [{ type: 'panel', rows: [
@@ -526,8 +677,11 @@ function secretPage(c, name, scope = '') {
         edit: { action: 'replace', title: `Replace ${name}`, submit: 'Replace', hidden: { name },
           fields: [{ name: 'value', label: 'New value', kind: 'secret', required: true,
             hint: 'The old value is overwritten. Houses pick up the new one the next time they start.' }] } },
-    { label: 'Last used', value: u ? `${named(u.agent)}'s house, ${ago(u.at)}` : 'Not given to a house yet',
-      ...(u ? { detail: u.how === 'issue' ? 'Given when the house started' : 'Read with a grant' } : {}) },
+    { label: 'Where it’s used', value: everUsed(u) ? whereWords(u) : 'Not given to a house yet',
+      ...(hostLast ? { detail: u.host.how === 'podman' ? 'Last put into a podman secret' : 'Last read by a host script, or at a terminal' }
+        : latest ? { detail: latest.how === 'issue' ? 'Last given when a house started' : 'Last read with a grant' } : {}) },
+    { label: 'Set', value: u?.set ? `${SET_WORDS[u.set.how] ?? 'Set'} ${ago(u.set.at)}` : 'Not on record',
+      detail: u?.set ? when(u.set.at) : 'It was stored before the piece kept a record of changes.' },
   ] }] });
   const agents = scope ? [scope] : knownAgents(c);
   const rows = rule?.grant === 'never'
@@ -541,7 +695,9 @@ function secretPage(c, name, scope = '') {
           toggle: { action: 'auto', on: g.auto, fields: { name, agent: a } } },
       ];
     });
-  if (rows.length) sections.push({ id: 'who', title: 'Who gets it', blocks: [{ type: 'panel', rows }] });
+  if (rows.length && rule?.grant !== 'never' && !scope) rows.push({ label: 'Any other house',
+    value: policy.default === 'auto' ? 'Gets it when it asks' : policy.default === 'never' ? 'Refused' : 'Asks you first' });
+  if (rows.length) sections.push({ id: 'who', title: 'Who can read it', blocks: [{ type: 'panel', rows }] });
   sections.push(...liveSection(rs), ...pastSection(rs, { withSecret: false }));
   if (!scope) sections.push({ id: 'more', blocks: [{ type: 'panel', rows: [
     { label: 'The record', value: 'Its rule and request ids', sheet: { title: name, blocks: [
@@ -721,6 +877,7 @@ async function importPart(c, env, io, force) {
     if (names(c).length > 0 && !force) throw new Fail('refused: the store filled up while importing; nothing was written.', 3);
     encrypt(c, env, secrets);
   });
+  for (const name of Object.keys(secrets).sort()) record(c, { event: 'set', secret: name, how: 'restore' });
   return Object.keys(secrets).length;
 }
 
@@ -839,7 +996,11 @@ export async function main(argv, io) {
       try { r = may(c, agent, args2[0]); } catch (err) { throw new Fail(err.message, 2); }
       if (r.may !== 'allowed') throw new Fail(`refused: ${r.may} for ${agent}: ${r.why}`, 4);
       const data = decrypt(c, io.env);
-      if (!Object.hasOwn(data, args2[0])) throw new Fail(`no secret named ${args2[0]}`, 3);
+      if (!Object.hasOwn(data, args2[0])) {
+        // A house was meant to start with it and it isn't stored: the page's Needs a look says so.
+        record(c, { event: 'missing', secret: args2[0], agent, ...(house ? { house } : {}) });
+        throw new Fail(`no secret named ${args2[0]}`, 3);
+      }
       auditIssue(c, agent, args2[0], house);
       io.stdout(data[args2[0]]);
       return 0;
@@ -903,6 +1064,8 @@ export async function main(argv, io) {
       }
       const data = decrypt(c, io.env);
       if (!Object.hasOwn(data, pos[0])) throw new Fail(`no secret named ${pos[0]}`, 3);
+      // Read on loom's machine (a host script, or the owner at a terminal): its page says where it's used.
+      record(c, { event: 'host-read', secret: pos[0], how: 'get' });
       io.stdout(data[pos[0]] + (io.stdoutIsTTY ? '\n' : ''));
       return 0;
     }
@@ -921,6 +1084,7 @@ export async function main(argv, io) {
       // podman, like sops, wants a real pipe on stdin, not node's socketpair.
       run('sh', ['-c', 'cat | "$0" "$@"', c.podman, 'secret', 'create', '--replace', pos[1], '-'],
         { input: data[pos[0]], env: io.env });
+      record(c, { event: 'host-read', secret: pos[0], how: 'podman' });
       io.stderr(`podman secret ${pos[1]} <- ${pos[0]}\n`);
       return 0;
     }

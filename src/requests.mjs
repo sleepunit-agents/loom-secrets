@@ -317,6 +317,11 @@ export function setHouses(c, secret, agent, on, who) {
   });
 }
 
+/** A store event for the record (set, removed, host-read, missing): names only, never a value. Never fails the caller. */
+export function record(c, event) {
+  try { audit(c, event); } catch { /* the record is a courtesy: a store write or a read never fails on it */ }
+}
+
 /** An issue to a house at start, as the runtime asked: recorded, never the value. */
 export function auditIssue(c, agent, secret, house) {
   audit(c, { event: 'issue', secret, agent, ...(house ? { house } : {}), by: 'runtime' });
