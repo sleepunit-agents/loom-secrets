@@ -107,6 +107,12 @@ test('podman injects the value over stdin, never argv, and prints nothing', { sk
   assert.match(log, /argv: secret create --replace art-google-pass -\n/);
   assert.match(log, /stdin: v2\n/);
   assert.ok(!/argv:.*v2/.test(log), 'value reached podman argv');
+  // On the record as a read on loom's machine, by podman: the name, never the value.
+  const last = readFileSync(join(env.LOOM_SECRETS_DIR, 'audit.jsonl'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l)).pop();
+  assert.deepEqual([last.event, last.secret, last.how, 'value' in last], ['host-read', 'google-pass', 'podman', false]);
+  const where = JSON.parse(cli(['ui', 'page', '--json'], { input: JSON.stringify({ path: 'secret', query: { name: 'google-pass' } }) }).stdout)
+    .sections.find((s) => s.id === 'secret').blocks[0].rows.find((x) => x.label === 'Where it’s used');
+  assert.deepEqual([where.value, where.detail], ["Loom's machine, just now", 'Last put into a podman secret']);
 });
 
 test('rm removes; unknown names are exit 3; bad names are exit 2', { skip }, () => {
@@ -464,12 +470,11 @@ test('bundle import round trip: a fresh store B gets every name and value, under
   for (const v of Object.values(BUNDLE_VALUES)) assert.ok(!raw.includes(v.trim().split('\n')[0]), 'plaintext on disk');
   const leftovers = execFileSync('ls', ['-a', join(bdir, 'b')], { encoding: 'utf-8' }).trim().split('\n').sort();
   assert.deepEqual(leftovers, ['.', '..', 'age.key', 'audit.jsonl', 'store.sops.json'], 'no temp or lock files left behind');
-  // The record says when each was set or removed: names, never a value.
-  const record = readFileSync(join(uiEnv.LOOM_SECRETS_DIR, 'audit.jsonl'), 'utf-8');
-  assert.match(record, /"event":"set","secret":"example-token","how":"add"/);
-  assert.match(record, /"event":"set","secret":"example-token","how":"replace"/);
-  assert.match(record, /"event":"removed","secret":"b.second"/);
-  for (const v of VALUES) assert.ok(!record.includes(v), 'a value reached the record');
+  // The record says each name was restored: names, never a value.
+  const rawRecord = readFileSync(join(bdir, 'b', 'audit.jsonl'), 'utf-8');
+  assert.deepEqual(rawRecord.trim().split('\n').map((l) => JSON.parse(l)).filter((e) => e.event === 'set').map((e) => [e.event, e.secret, e.how]),
+    Object.keys(BUNDLE_VALUES).sort().map((n) => ['set', n, 'restore']));
+  for (const v of Object.values(BUNDLE_VALUES)) assert.ok(!rawRecord.includes(v.trim().split('\n')[0]), 'a value reached the record');
 });
 
 test('bundle import refuses over a store that holds secrets; --force replaces it', { skip: bskip }, () => {
@@ -1006,7 +1011,7 @@ test('61 secrets: the index is a short summary (needs a look first, then a row a
   for (const v of Object.values(values)) assert.ok(!record.includes(v), 'a value reached the record');
 });
 
-test('a house that was meant to start with a secret that isn\'t stored shows under Needs a look; adding it clears it', { skip }, () => {
+test('a secret the rules give a house that isn\'t stored shows under Needs a look; adding it clears it', { skip }, () => {
   const d = join(dir, 'ui-missing');
   const extra = { LOOM_SECRETS_DIR: d, LOOM_SECRETS_SOPS: SOPS };
   const run = (args, input, more = {}) => spawnSync(process.execPath, [CLI, ...args], { input: input ?? '', env: { ...env, ...extra, ...more }, encoding: 'utf-8' });
@@ -1014,7 +1019,7 @@ test('a house that was meant to start with a secret that isn\'t stored shows und
   assert.equal(run(['add', 'gone-token'], 'v-gone').status, 0);
   assert.equal(run(['policy', 'houses', 'gone-token', 'art']).status, 0);
   assert.equal(run(['rm', 'gone-token']).status, 0);
-  // The rule stays; the runtime tries to hand it to a house it starts, and can't.
+  // The rule stays, so the runtime would try to hand it to Art's next house, and can't.
   assert.equal(run(['issue', 'gone-token', '--agent', 'art', '--house', 'h-5'], '', { LOOM_PIECE_NAME: 'runtime' }).status, 3);
   const look = () => rowsOf(ui(['page'], { path: '', query: {} }, extra), 'look');
   assert.deepEqual(look().map((r) => [r.label, r.value]), [['gone-token', 'Not in the store']]);
@@ -1024,4 +1029,27 @@ test('a house that was meant to start with a secret that isn\'t stored shows und
   assert.equal(r.ok, true, r.message);
   assert.ok(!look().some((x) => x.label === 'gone-token'));
   assert.equal(rowsOf(ui(['page'], { path: 'secret', query: { name: 'gone-token' } }, extra), 'secret').find((x) => x.label === 'Set').value, 'Added just now');
+});
+
+test('the rest follow the policy\'s default; an agent\'s tab sees only its own use; a fresh store\'s secret still says who can read it', { skip }, () => {
+  const d = join(dir, 'ui-default');
+  const extra = { LOOM_SECRETS_DIR: d, LOOM_SECRETS_SOPS: SOPS };
+  const run = (args, input, more = {}) => spawnSync(process.execPath, [CLI, ...args], { input: input ?? '', env: { ...env, ...extra, ...more }, encoding: 'utf-8' });
+  assert.equal(run(['init']).status, 0);
+  assert.equal(run(['add', 'lone-token'], 'v-lone').status, 0);
+  // No agent known: Who can read it is still there, saying what any house gets.
+  const lone = ui(['page'], { path: 'secret', query: { name: 'lone-token' } }, extra);
+  assert.deepEqual(rowsOf(lone, 'who').map((r) => [r.label, r.value]), [['Any house', 'Asks you first']]);
+  // The policy's default decides what the rest are called.
+  writeFileSync(join(d, 'policy.json'), JSON.stringify({ v: 1, default: 'auto', secrets: { 'lone-token': { houses: ['art', 'mark'] } } }));
+  assert.equal(run(['add', 'other-token'], 'v-other').status, 0);
+  const groups = rowsOf(ui(['page'], { path: '', query: {} }, extra), 'groups');
+  assert.ok(groups.some((r) => r.label === 'Any house that asks' && r.value === '1 secret'));
+  assert.ok(!groups.some((r) => r.label === 'Only when you say yes'));
+  // Both agents' houses had it; Art's tab says only Art's.
+  for (const [agent, h] of [['art', 'h-1'], ['mark', 'h-2']]) assert.equal(run(['issue', 'lone-token', '--agent', agent, '--house', h], '', { LOOM_PIECE_NAME: 'runtime' }).status, 0);
+  const where = (more) => rowsOf(ui(['page'], { path: 'secret', query: { name: 'lone-token' } }, { ...extra, ...more }), 'secret').find((r) => r.label === 'Where it’s used').value;
+  assert.match(where({}), /Art's houses/);
+  assert.match(where({}), /Mark's houses/);
+  assert.equal(where({ LOOM_SCOPE: 'art' }), "Art's houses, just now");
 });

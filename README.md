@@ -92,19 +92,18 @@ The page (`""`) is a summary of app panels (loom's `docs/extensions.md`,
 "Panels"), so it stays short however many secrets there are:
 
 - **Waiting on you**: houses' requests, each answer in a sheet.
-- **Needs a look**: a name a house is meant to get that isn't stored (the rules
-  give it out, or a house just tried to start with it), with an add form for that
-  name; secrets not changed in a year, when the record knows; and secrets nobody
+- **Needs a look**: a name the rules give a house that isn't stored (the runtime
+  would fail to hand it over), with an add form for that name; secrets not changed in a year, when the record knows; and secrets nobody
   uses (no agent gets them without asking, and nothing on record has had them).
   Past three missing names, and always for the others, it's a row with a count.
 - **Who can use them**: a row a group, with its count: each agent (its houses get
   the secret at start, or without asking you), loom's machine (read there, by a
-  host script or `podman`), only when you say yes, never given out, and all of
-  them. A secret given to two agents is in both.
+  host script or `podman`), the rest (only when you say yes, or what the policy's
+  default says), never given out, and all of them. A secret given to two agents is in both.
 - **Add a secret** (a row whose sheet takes the name and the value), and the
   policy in words.
 
-Each group is a list (`list?of=agent:art`, `of=ask`, `of=all`, …): a row a
+Each group is a list (`list?of=agent%3Aart`, `of=ask`, `of=all`, …): a row a
 secret, saying who gets it ("Art at start") and when it was last had ("Last
 given to Art's house 5 min ago"). The whole store (`of=all`) has a search and a
 filter (`?q=`, `?who=start|asked|ask|never`); a list past 200 names is split into
@@ -123,9 +122,8 @@ gets, its waiting, live and past requests, and its own switches; the household's
 lists aren't on it.
 
 What the page knows of use and change is `audit.jsonl`: beside the requests, it
-records a value set (`add`, `replace`, a restore), a removal, a read on loom's
-machine (`get --reveal`, `podman`), and a house that couldn't start with a name
-that isn't stored. Names and times, never a value. Reads on loom's machine are on
+records a value set (`add`, `replace`, a restore), a removal, and a read on
+loom's machine (`get --reveal`, `podman`). Names and times, never a value. Reads on loom's machine are on
 record from this version on, so a secret only a host script reads counts as
 unused until its next read.
 
