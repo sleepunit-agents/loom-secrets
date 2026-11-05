@@ -88,22 +88,44 @@ echo '{"path":"","query":{}}' | loom-secrets ui page --json
 echo '{"action":"add","path":"","fields":{"name":"x","value":"..."}}' | loom-secrets ui act --json
 ```
 
-The page (`""`) is an app panel (loom's `docs/extensions.md`, "Panels"):
-**Add a secret** is a row whose sheet takes the name and the value; **In the
-store** is a row for each name, saying who gets it ("Art at start") and when a
-house last got it ("Last given to Art's house 5 min ago", from the audit), with
-a search and a filter (`?q=`, `?who=start|asked|ask|never`). A secret's own page
-(`secret?name=<n>`) has its **Value** row (Replace, in a sheet), **Who gets it**:
-two switches an agent, *When a house starts* (`houses`) and *When a house asks*
-(`auto`, without asking you), its waiting requests (each answer in a sheet), live
-grants (each with Revoke), what was asked before (each reason whole), and Remove;
-its rule and request ids sit behind *The record*. `ui act` takes `add` (refuses a
-name that exists and points to Replace), `replace` (the name must exist),
-`remove`, the switches `houses` and `auto` (`{name, agent, on: "on"|""}`), the
-answers `grant`, `always`, `deny`, `revoke` and `stop-always`. It answers
-`{ok, message, page: ""}`. A store bigger than one page allows (200 names) is
-split into parts, picked with `?part=`. Each agent's tab (`LOOM_SCOPE`) shows
-what that agent gets, its waiting, live and past requests, and its own switches.
+The page (`""`) is a summary of app panels (loom's `docs/extensions.md`,
+"Panels"), so it stays short however many secrets there are:
+
+- **Waiting on you**: houses' requests, each answer in a sheet.
+- **Needs a look**: a name the rules give a house that isn't stored (the runtime
+  would fail to hand it over), with an add form for that name; secrets not changed in a year, when the record knows; and secrets nobody
+  uses (no agent gets them without asking, and nothing on record has had them).
+  Past three missing names, and always for the others, it's a row with a count.
+- **Who can use them**: a row a group, with its count: each agent (its houses get
+  the secret at start, or without asking you), loom's machine (read there, by a
+  host script or `podman`), the rest (only when you say yes, or what the policy's
+  default says), never given out, and all of them. A secret given to two agents is in both.
+- **Add a secret** (a row whose sheet takes the name and the value), and the
+  policy in words.
+
+Each group is a list (`list?of=agent%3Aart`, `of=ask`, `of=all`, …): a row a
+secret, saying who gets it ("Art at start") and when it was last had ("Last
+given to Art's house 5 min ago"). The whole store (`of=all`) has a search and a
+filter (`?q=`, `?who=start|asked|ask|never`); a list past 200 names is split into
+parts (`?part=`). A secret's own page (`secret?name=<n>`) has its **Value** row
+(Replace, in a sheet), **Where it's used** (each agent's houses and loom's
+machine, with when), **Set** (when it was added or changed, if the record knows),
+**Who can read it**: two switches an agent, *When a house starts* (`houses`) and
+*When a house asks* (`auto`, without asking you), and what any other house gets;
+its waiting requests, live grants (each with Revoke), what was asked before, and
+Remove; its rule and request ids sit behind *The record*. `ui act` takes `add`
+(refuses a name that exists and points to Replace), `replace` (the name must
+exist), `remove`, the switches `houses` and `auto` (`{name, agent, on: "on"|""}`),
+the answers `grant`, `always`, `deny`, `revoke` and `stop-always`. It answers
+`{ok, message, page: ""}`. Each agent's tab (`LOOM_SCOPE`) shows what that agent
+gets, its waiting, live and past requests, and its own switches; the household's
+lists aren't on it.
+
+What the page knows of use and change is `audit.jsonl`: beside the requests, it
+records a value set (`add`, `replace`, a restore), a removal, and a read on
+loom's machine (`get --reveal`, `podman`). Names and times, never a value. Reads on loom's machine are on
+record from this version on, so a secret only a host script reads counts as
+unused until its next read.
 
 The page is **write-only**: you can put a value in, but you can't read it back
 (ac-sec-ui-*). A value typed into the form goes to loom, which checks the
